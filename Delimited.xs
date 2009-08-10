@@ -179,7 +179,7 @@ static void init_delim (pTHX_ delim_t *marker) {
 	marker->prev = MY_CXT.last_mark;
 
 	/* pointers have to be converted to relative indices */
-	marker->stack  = PL_stack_sp - PL_stack_base;
+	marker->stack  = PL_stack_sp      - PL_stack_base;
 	marker->marks  = PL_markstack_ptr - PL_markstack;
 
 	/* these relative indices are not reused when resetting the state on
@@ -195,6 +195,8 @@ static void init_delim (pTHX_ delim_t *marker) {
 
 	marker->curpad = PL_curpad;
 	marker->comppad = PL_comppad;
+
+	printf("init delim, SP=%p\n", PL_stack_sp);
 }
 
 static delim_t* create_delim (pTHX) {
@@ -245,10 +247,12 @@ static void init_cont_stack (pTHX_ cont_t *cont) {
 	cont->stack = stack;
 
 	/* make sure all the values are refcounted in the */
+	printf("stack len: %d\n", stack_len);
 	for ( i = 0; i < stack_len; i++ ) {
 		SV *sv = PL_stack_base[start->stack + i];
 		SvREFCNT_inc(sv);
 		av_push(stack, sv);
+		sv_dump(sv);
 	}
 
 	cont->marks_len = end->marks - start->marks;
@@ -263,8 +267,8 @@ static void init_cont_stack (pTHX_ cont_t *cont) {
 		cont->marks = NULL;
 	}
 
-	PL_stack_sp      = PL_stack_base + start->stack;
-	PL_markstack_ptr = PL_markstack + start->marks;
+	PL_stack_sp      = start->stack + PL_stack_base;
+	PL_markstack_ptr = start->marks + PL_markstack;
 }
 
 static void init_cont_scopes (pTHX_ cont_t *cont) {
@@ -293,6 +297,11 @@ static void init_cont_scopes (pTHX_ cont_t *cont) {
 		for ( i = cont->cxs_len - 1; i >= 0; i-- ) {
 			PERL_CONTEXT *cx = &cxs[i];
 
+			/* convert the various values into 0 based offsets,  */
+			cx->blk_oldsp      -= cont->start->stack;
+			cx->blk_oldmarksp  -= cont->start->marks;
+			cx->blk_oldscopesp -= cont->start->scopes;
+
 			if ( CxTYPE(cx) == CXt_SUB ) {
 				CV *cv = cx->blk_sub.cv;
 
@@ -305,6 +314,12 @@ static void init_cont_scopes (pTHX_ cont_t *cont) {
 
 				/* unwind the ctx */
 				CvDEPTH(cv) = cx->blk_sub.olddepth;
+
+				/* 0 based offset logic for non reified @_ */
+				if ( !AvREAL(cx->blk_sub.argarray) ) {
+					printf("non reified @_\n");
+					CLEAR_ARGARRAY(cx->blk_sub.argarray);
+				}
 			}
 		}
 	} else {
@@ -416,27 +431,11 @@ static void init_cont (pTHX_ cont_t *cont) {
  *
  * this operation should be invokable multiple times */
 static void restore_cont (pTHX_ cont_t *cont, OP *retop) {
-	I32 i, j, end;
+	I32 i, end;
 	dSP;
 	SV **stack = AvARRAY(cont->stack);
 	I32 stack_len = av_len(cont->stack) + 1;
 	I32 cvs_len = av_len(cont->cvs) + 1;
-
-	for ( i = 0; i < cont->marks_len; i++ ) {
-	   PUSHMARK( SP + cont->marks[i] );
-	}
-
-	if ( stack_len ) {
-		printf("len: %d\n", stack_len);
-		printf("SP=%p\n", SP);
-		EXTEND(SP, stack_len);
-		Copy(stack, SP + 1, stack_len, SV *);
-		SP += stack_len;
-
-		printf("SP=%p\n", SP);
-
-		PUTBACK;
-	}
 
 	/* no need for tmps, the refcnt is at least 1 so still live, and they will
 	 * be decremented when the continuation is destroyed  */
@@ -459,25 +458,93 @@ static void restore_cont (pTHX_ cont_t *cont, OP *retop) {
 		Renew(cxstack, end, PERL_CONTEXT);
 
 	Copy(cont->cxs, &cxstack[cxstack_ix+1], cont->cxs_len, PERL_CONTEXT);
-	cxstack[cxstack_ix+1].blk_sub.retop = retop;
 
-	i = 0; /* offset */
+	/* setup top context */
+	cxstack[cxstack_ix+1].blk_sub.retop     = retop;
+	cxstack[cxstack_ix+1].blk_sub.savearray = GvAV(PL_defgv);
+	// cxstack[cxstack_ix+1].blk_gimme = GIMME_V; /* FIXME won't propagate */
+
 	while ( cxstack_ix < end ) {
 		PERL_CONTEXT *cx = &cxstack[++cxstack_ix];
+		AV *args;
+
+		/* convert the 0 based offsets to match the current interpreter state */
+		cx->blk_oldsp      += PL_stack_sp      - PL_stack_base;
+		cx->blk_oldmarksp  += PL_markstack_ptr - PL_markstack;
+		cx->blk_oldscopesp += PL_scopestack_ix;
 
 		if ( CxTYPE(cx) == CXt_SUB ) { /* FIXME fallthrough for CXt_BLOCK comppad handling */
-			CV *cv = cx->blk_sub.cv;
-			AV *pad = (AV *)*av_fetch(cont->pads, i, 0);
+			printf("copying pad\n");
+			CV *cv  = cx->blk_sub.cv;
+			AV *pad_av = cx->blk_sub.oldcomppad;
+			AV *names_av = (AV *)AvARRAY(CvPADLIST(cv))[0];
+			SV **pad   = AvARRAY(pad_av);
+			SV **names = AvARRAY(names_av);
+			I32 pad_fill   = AvFILLp(pad_av);
+			I32 names_fill = AvFILLp(names_av);
 
-			/* the indices should match up */
-			assert(cv == (CV *)*av_fetch(cont->cvs, i, 0));
+			printf("names fill: %d, pad_fill: %d\n", names_fill, pad_fill);
 
-			/* create a new comppad */
+			/* create a new comppad AV, with the same SVs as the previous one */
 			AV *copy = newAV();
+			for ( i = 1; i <= pad_fill; i++ ) {
+				SV *sv = pad[i];
+				SV *name = &PL_sv_undef;
+				SV *new  = &PL_sv_undef;
 
-			for ( j = 0; j <= av_len(pad); j++ ) {
-				av_push(copy, *av_fetch(pad, j, 0));
+				if ( i <= names_fill ) {
+					name = names[i];
+				}
+
+				if ( name != &PL_sv_undef ) {
+					const char sigil = SvPVX_const(name)[0];
+
+					if ( SvFLAGS(name) & SVf_FAKE || sigil == '&' ) {
+						new = SvREFCNT_inc(sv);
+					} else {
+						/* FIXME clone sv */
+
+						if ( sigil == '@' ) {
+							new = (SV *)newAV();
+						} else if ( sigil == '%' ) {
+							new = (SV *)newHV();
+						} else {
+							new = newSVsv(sv);
+						}
+					}
+				} else {
+					switch (SvTYPE(sv)) {
+						case SVt_NULL:
+						case SVt_PV:
+						case SVt_IV:
+						case SVt_NV:
+						case SVt_PVIV:
+						case SVt_PVNV:
+						case SVt_RV:
+							new = newSVsv(sv);
+							break;
+						case SVt_PVAV:
+							new = (SV *)newAV();
+							break;
+						case SVt_PVHV:
+							new = (SV *)newHV();
+							break;
+						default:
+							printf("WTF\n");
+							new = newSV(0);
+					}
+				}
+
+				av_store(copy, i, new);
 			}
+
+			args = newAV();
+			av_store(copy, 0, (SV *)args); /* FIXME what does pad_push do? */
+			cx->blk_sub.savearray = GvAV(PL_defgv);
+			GvAV(PL_defgv) = SvREFCNT_inc_simple(args);
+			cx->blk_sub.argarray = args;
+
+			/* FIXME need to work out sp/mark from oldsp and friends to count args and copy */
 
 			cx->blk_sub.olddepth = CvDEPTH(cv);
 
@@ -486,16 +553,28 @@ static void restore_cont (pTHX_ cont_t *cont, OP *retop) {
 
 			cx->blk_sub.oldcomppad = copy;
 
-			if ( pad == cont->end->comppad ) {
+			if ( pad_av == cont->end->comppad ) {
+				printf("stashing comppad %p, replacing with %p\n", PL_comppad, copy);
 				SAVECOMPPAD(); /* FIXME horrible kludge, need to fixup savestack like we will for local() */
 				PL_comppad = copy;
 			}
-
-			i++;
 		}
 	}
 
 	PL_curpad = AvARRAY(PL_comppad);
+
+	for ( i = 0; i < cont->marks_len; i++ ) {
+		PUSHMARK( SP + cont->marks[i] );
+	}
+
+	if ( stack_len ) {
+		EXTEND(SP, stack_len);
+		Copy(stack, SP + 1, stack_len, SV *);
+		SP += stack_len;
+
+		PUTBACK;
+	}
+
 }
 
 static cont_t *create_cont (pTHX) {
@@ -525,8 +604,9 @@ static void invoke_hook (pTHX) {
 	dSP;
 	I32 i;
 
+	printf("invoking\n");
+
 	printf("SP=%p, MARK=%d\n", SP, TOPMARK);
-	sv_dump(*SP);
 
 	restore_cont(MY_CXT.cont, MY_CXT.retop);
 	MY_CXT.cont = NULL;
@@ -535,10 +615,12 @@ static void invoke_hook (pTHX) {
 	SPAGAIN;
 
 	printf("SP=%p, MARK=%d\n", SP, TOPMARK);
-	sv_dump(*SP);
+
+	printf("appending extra args\n");
 
 	EXTEND(SP, MY_CXT.items);
 
+	PUSHMARK(SP);
 	for ( i = 0; i < MY_CXT.items; i++ ) {
 		SV *sv = MY_CXT.args[i];
 
@@ -557,16 +639,20 @@ static void invoke_hook (pTHX) {
 XS(XS_Continuation__Delimited_cont_invoke); /* prototype to pass -Wmissing-prototypes */
 XS(XS_Continuation__Delimited_cont_invoke)
 {
+	printf("stashing args, SP=%p\n", PL_stack_sp);
 #ifdef dVAR
 	dVAR; dXSARGS;
 #else
 	dXSARGS;
 #endif
 	/* stash the arguments */
+	printf("stashing args, SP=%p, items=%d\n", SP, items);
+	sv_dump(*SP);
 	SP -= items;
 	Newx(MY_CXT.args, items, SV *);
 	Copy(SP + 1, MY_CXT.args, items, SV *);
 	MY_CXT.items = items;
+	printf("stashed args, SP=%p, items=%d\n", SP, items);
 
 	PUTBACK;
 
@@ -591,6 +677,8 @@ static CV *cont_to_cv (pTHX_ cont_t *cont) {
 static void cont_shift_hook (pTHX) {
 	dSP;
 
+	PL_stack_sp--; /* Enforce some insanity in scalar context. */
+
 	cont_t *cont = create_cont(aTHX);
 	CV *cont_cv = cont_to_cv(aTHX_ cont);
 
@@ -600,6 +688,18 @@ static void cont_shift_hook (pTHX) {
 	XPUSHs(sv_2mortal(newRV_inc((SV *)cont_cv)));
 	PUTBACK;
 	push_block(aTHX);
+}
+
+static void cont_reset_hook (pTHX) {
+	PL_stack_sp--; /* Enforce some insanity in scalar context. */
+	push_delim(aTHX);
+}
+
+static void stackdump (pTHX) {
+	printf("SP=%p mark=%p\n", PL_stack_sp, TOPMARK);
+	printf("curpad=%p comppad=%p\n", PL_curpad, PL_comppad);
+	sv_dump(PL_comppad);
+	debstack();
 }
 
 MODULE = Continuation::Delimited		PACKAGE = Continuation::Delimited
@@ -628,6 +728,8 @@ cont_shift (CV *block)
 
 		setup_trampoline(aTHX_ cont_shift_hook);
 
+		XSRETURN(0);
+
 void
 cont_reset (CV *block)
 	PROTOTYPE: &
@@ -636,3 +738,10 @@ cont_reset (CV *block)
 		SvREFCNT_inc(block);
 
 		setup_trampoline(aTHX_ push_delim);
+
+		XSRETURN(0);
+
+void stk ()
+	PPCODE:
+		setup_trampoline(aTHX_ stackdump);
+		XSRETURN(0);

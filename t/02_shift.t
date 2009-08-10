@@ -9,7 +9,6 @@ use Devel::Peek qw(DumpArray Dump);
 
 use ok 'Continuation::Delimited' => qw(cont_reset cont_shift);
 
-# FIXME breaks if these are lexicals
 my $after = 0;
 my $invoked = 0;
 my $created = 0;
