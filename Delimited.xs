@@ -550,6 +550,9 @@ static void init_cont_saves (pTHX_ cont_t *cont) {
 	PL_savestack_ix  = start->saves;
 	PL_scopestack_ix = start->scopes;
 
+	printf("top save: %d\n", PL_savestack[PL_savestack_ix - 1].any_i32);
+	printf("top scope: %d, save ix=%d\n", PL_scopestack[PL_scopestack_ix - 1], PL_savestack_ix);
+
 	Newx(tmps, cont->tmps_len, SV *);
 	Copy(&PL_tmps_stack, tmps, cont->tmps_len, SV **);
 
@@ -625,12 +628,22 @@ static void restore_cont (pTHX_ cont_t *cont, OP *retop) {
 	I32 stack_len = av_len(cont->stack) + 1;
 	PTR_TBL_t *pads = ptr_table_new();
 
+	printf("restoring\n");
+
+	printf("top save: %d\n", PL_savestack[PL_savestack_ix - 1].any_i32);
+	printf("top scope: %d, save ix=%d\n", PL_scopestack[PL_scopestack_ix - 1], PL_savestack_ix);
+
+
 	/* restore all the interpreter variables to the state at the end of the  */
 #define VAR(name, type) PL_ ## name = cont->end->name;
 #include "state.h"
 #undef VAR
 
 	/* clone the pads, fixup the contexts */
+
+	printf("top save: %d\n", PL_savestack[PL_savestack_ix - 1].any_i32);
+	printf("top scope: %d, save ix=%d\n", PL_scopestack[PL_scopestack_ix - 1], PL_savestack_ix);
+
 
 	end = cxstack_ix + cont->cxs_len;
 
@@ -745,6 +758,24 @@ static void restore_cont (pTHX_ cont_t *cont, OP *retop) {
 		}
 	}
 
+	printf("top save: %d\n", PL_savestack[PL_savestack_ix - 1].any_i32);
+	printf("top scope: %d, save ix=%d\n", PL_scopestack[PL_scopestack_ix - 1], PL_savestack_ix);
+
+
+	/* FIXME, this is horrible, but there's nothing in the Perl api for it */
+	if ( PL_scopestack_ix + cont->scopes_len > PL_scopestack_max ) {
+		PL_scopestack_max = GROW(PL_scopestack_max + cont->scopes_len);
+		Renew(PL_scopestack, PL_scopestack_max, I32);
+	}
+
+	for ( i = 0; i < cont->scopes_len; i++ ) {
+		PL_scopestack[PL_scopestack_ix++] = PL_savestack_ix + cont->scopes[i];
+	}
+	printf("scopescack_ix=%d\n", PL_scopestack_ix);
+	printf("top save: %d\n", PL_savestack[PL_savestack_ix - 1].any_i32);
+	printf("top scope: %d, save ix=%d\n", PL_scopestack[PL_scopestack_ix - 1], PL_savestack_ix);
+
+
 	if ( cont->repeat_len ) {
 		/* FIXME fixup SAVECOMPPAD entries, fix 0 based offsets */
 		SSGROW(PL_savestack_ix + cont->repeat_len);
@@ -789,15 +820,6 @@ static void restore_cont (pTHX_ cont_t *cont, OP *retop) {
 		PL_savestack_ix += cont->repeat_len;
 	}
 
-
-	/* FIXME, this is horrible, but there's nothing in the Perl api for it */
-	if ( PL_scopestack_ix + cont->scopes_len > PL_scopestack_max ) {
-		PL_scopestack_max = GROW(PL_scopestack_max + cont->scopes_len);
-		Renew(PL_scopestack, PL_scopestack_max, I32);
-	}
-
-	Copy(cont->scopes, &PL_scopestack[PL_scopestack_ix], cont->scopes_len, I32);
-	PL_scopestack_ix += cont->scopes_len;
 
 	/* fixup PL_comppad to point to the cloned pad corresponding to the top of the stack */
 	printf("overwriting PL_comppad=%p from end comppad=%p to %p\n", PL_comppad, cont->end->comppad, ptr_table_fetch(pads, cont->end->comppad));
