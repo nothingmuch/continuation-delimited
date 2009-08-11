@@ -1,0 +1,65 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+
+use Test::More 'no_plan';
+
+local $TODO = "this test is not yet implemented";
+fail("blech");
+exit;
+
+sub generator (&) {
+	my $body = shift;
+	my $k;
+
+	return sub {
+		local *yield = sub {
+			# a new value, $ret has been yielded
+			my $ret = shift;
+
+			cont_shift {
+				# capture the state in $k, and return $ret from cont_reset { }
+				# on the next invocation of the generator $k will be invoked to
+				# return from yield(), resuming the genrator body
+				$k = shift;
+				return $ret;
+			};
+		};
+
+		if ( $k ) {
+			# the generator is being invoked again while it is running
+			&$k;
+		} else {
+			# the generator is being invoked with no captured state
+			return cont_reset {
+				my $ret = &$body; # FIXME test that @_ is passed through properly
+				# the generator has returned normall (using return instead of
+				# yield), so it's finished. clear the captured state (if any) and return
+				# the value from cont_reset normally
+				undef $k;
+				return $ret;
+			};
+		}
+	}
+}
+
+my $gen = generator {
+	for ( 1 .. 2 ) {
+		yield($_); # FIXME check that yield returns the right thing
+	}
+
+	return "finished";
+};
+
+# FIXME also test for interleaved generators
+
+is( $gen->(), 1, "first yield" );
+is( $gen->(), 2, "second yield" );
+is( $gen->(), "finished", "normal return" );
+
+is( $gen->(), 1, "first yield" );
+is( $gen->(), 2, "second yield" );
+is( $gen->(), "finished", "normal return" );
+
+
