@@ -5,9 +5,7 @@ use warnings;
 
 use Test::More 'no_plan';
 
-local $TODO = "this test is not yet implemented";
-fail("blech");
-exit;
+use ok 'Continuation::Delimited' => qw(cont_reset cont_shift);
 
 sub generator (&) {
 	my $body = shift;
@@ -18,25 +16,37 @@ sub generator (&) {
 			# a new value, $ret has been yielded
 			my $ret = shift;
 
+			warn "yielding $ret";
+			Continuation::Delimited::stk();
+
+#$^D="DXstvRl";
 			cont_shift {
 				# capture the state in $k, and return $ret from cont_reset { }
 				# on the next invocation of the generator $k will be invoked to
 				# return from yield(), resuming the genrator body
 				$k = shift;
+$^D="";
+				warn "captured $k, returning $ret";
 				return $ret;
 			};
 		};
 
 		if ( $k ) {
+			warn "$k exists, resuming";
 			# the generator is being invoked again while it is running
+			Continuation::Delimited::stk();
 			&$k;
 		} else {
+			warn "restarting";
 			# the generator is being invoked with no captured state
 			return cont_reset {
+				Continuation::Delimited::stk();
+				printf("invoking body $body");
 				my $ret = &$body; # FIXME test that @_ is passed through properly
 				# the generator has returned normall (using return instead of
 				# yield), so it's finished. clear the captured state (if any) and return
 				# the value from cont_reset normally
+				warn "normal return, $ret";
 				undef $k;
 				return $ret;
 			};
@@ -45,8 +55,14 @@ sub generator (&) {
 }
 
 my $gen = generator {
-	for ( 1 .. 2 ) {
+	warn "in generator";
+	Continuation::Delimited::stk();
+	for ( 1 .. 3 ) {
+		warn "in loop, $_";
+		Continuation::Delimited::stk();
 		yield($_); # FIXME check that yield returns the right thing
+		warn "returned from loop";
+		Continuation::Delimited::stk();
 	}
 
 	return "finished";
@@ -54,12 +70,17 @@ my $gen = generator {
 
 # FIXME also test for interleaved generators
 
+ok( $gen, "got a generator" );
+is( ref($gen), "CODE", "looks like a coderef" );
+
 is( $gen->(), 1, "first yield" );
 is( $gen->(), 2, "second yield" );
+is( $gen->(), 3, "third yield" );
 is( $gen->(), "finished", "normal return" );
 
 is( $gen->(), 1, "first yield" );
 is( $gen->(), 2, "second yield" );
+is( $gen->(), 3, "third yield" );
 is( $gen->(), "finished", "normal return" );
 
 
