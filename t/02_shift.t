@@ -14,9 +14,6 @@ my $invoked = 0;
 my $created = 0;
 
 
-Continuation::Delimited::stk();
-#$^D="DXstvRL";
-
 my $add = cont_reset {
 	#pass("inside delimited scope");
 
@@ -29,10 +26,8 @@ my $add = cont_reset {
 
 		is( $created++, 0, "first shift" );
 
-#$^D="DXstvRL";
 		return $k; # FIXME test fallthrough as well
 	};
-	$^D="";
 
 	pass("invoked cont");
 	$invoked++;
@@ -41,11 +36,8 @@ my $add = cont_reset {
 
 	ok($value, "got a value ($value)");
 
-#$^D="DXstvRl";
 	return $value + 7;
 };
-
-$^D="";
 
 pass("escaped");
 
@@ -56,11 +48,7 @@ is( $invoked, 0, "not yet invoked" );
 
 $after++;
 
-#$^D="DXstvRl";
-Continuation::Delimited::stk();
 my $x = $add->(4);
-Continuation::Delimited::stk();
-$^D="";
 is( $x, 11, "cont works" );
 is( $invoked, 1, "invoked once" );
 
