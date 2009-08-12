@@ -125,6 +125,7 @@ static void print_cont (cont_t *cont) {
 
 static void push_block (pTHX) {
 	dSP;
+	dMY_CXT;
 
 	assert(MY_CXT.block != NULL);
 
@@ -139,6 +140,8 @@ static void push_block (pTHX) {
  * XSUB context on the stack */
 static OP *entersub_wrapper (pTHX) {
 	dSP;
+	dMY_CXT;
+
 	bool entersub = MY_CXT.block != NULL;
 
 	trace("entersub stack pos %p (%d)\n", PL_stack_sp, PL_stack_sp - PL_stack_base);
@@ -169,6 +172,7 @@ static OP *entersub_wrapper (pTHX) {
 
 /* setup PL_op to trampoline into a block without an XSUB context */
 static void setup_trampoline_cb (pTHX_ void *ptr) {
+	dMY_CXT;
 	int flags = GIMME_V;
 
 	trace("trigered stack pos %p (%d)\n", PL_stack_sp, PL_stack_sp - PL_stack_base);
@@ -193,6 +197,8 @@ static void setup_trampoline_cb (pTHX_ void *ptr) {
 }
 
 static void setup_trampoline (pTHX_ void (*hook)(pTHX)) {
+	dMY_CXT;
+
 	MY_CXT.hook = hook;
 
 	/* these get triggered on LEAVE inside ENTERSUB */
@@ -203,6 +209,8 @@ static void setup_trampoline (pTHX_ void (*hook)(pTHX)) {
 
 /* captures values from the interpreter state */
 static void init_delim (pTHX_ delim_t *marker) {
+	dMY_CXT;
+
 	marker->prev = MY_CXT.last_mark;
 
 	/* pointers have to be converted to relative indices */
@@ -240,12 +248,16 @@ static void destroy_delim (pTHX_ delim_t *marker) {
 }
 
 static void pop_delim (pTHX) {
+	dMY_CXT;
+
 	delim_t *prev = MY_CXT.last_mark->prev;
 	destroy_delim(aTHX_ MY_CXT.last_mark);
 	MY_CXT.last_mark = prev;
 }
 
 static void delim_destructor (pTHX_ void *ptr) {
+	dMY_CXT;
+
 	if ( ptr == MY_CXT.last_mark ) {
 		/* unused delimiter, no shift { } captured it */
 		pop_delim(aTHX);
@@ -256,7 +268,9 @@ static void delim_destructor (pTHX_ void *ptr) {
 }
 
 static void push_delim (pTHX) {
-	MY_CXT.last_mark = create_delim();
+	dMY_CXT;
+
+	MY_CXT.last_mark = create_delim(aTHX);
 	SAVEDESTRUCTOR_X(delim_destructor, (void *)MY_CXT.last_mark);
 	/* FIXME does this unwind at the right time? i think reset { }; shift { }
 	 * might cause a stale delimiter to be visible to shift { } */
@@ -607,6 +621,8 @@ static void init_cont_state (pTHX_ cont_t *cont) {
 #include "state.h"
 #undef VAR
 
+	dMY_CXT;
+
 	PL_comppad = cont->start->comppad;
 	PL_curpad  = cont->start->curpad;
 
@@ -623,6 +639,8 @@ static void init_cont_state (pTHX_ cont_t *cont) {
  * all stack unwinding operations need to be deferred until the continuation
  * object is garbage collected */
 static void init_cont (pTHX_ cont_t *cont) {
+	dMY_CXT;
+
 	assert(MY_CXT.last_mark != NULL); /* FIXME if reset() was not called do we
 										 have an implicit reset for the top of
 										 the program? */
@@ -649,6 +667,8 @@ static void init_cont (pTHX_ cont_t *cont) {
 }
 
 void save_delim (pTHX_ void *ptr) {
+	dMY_CXT;
+
 	MY_CXT.last_mark = (delim_t *)ptr;
 }
 
@@ -658,6 +678,8 @@ void save_delim (pTHX_ void *ptr) {
 static void restore_cont (pTHX_ cont_t *cont, OP *retop) {
 	I32 i, end;
 	dSP;
+	dMY_CXT;
+
 	SV **stack = AvARRAY(cont->stack);
 	I32 stack_len = av_len(cont->stack) + 1;
 	PTR_TBL_t *cloned = ptr_table_new();
@@ -665,7 +687,7 @@ static void restore_cont (pTHX_ cont_t *cont, OP *retop) {
 
 	trace("restoring\n");
 
-	push_delim();
+	push_delim(aTHX);
 	print_delim(MY_CXT.last_mark);
 
 	trace("top save: %d\n", PL_savestack[PL_savestack_ix - 1].any_i32);
@@ -943,7 +965,7 @@ static cont_t *create_cont (pTHX) {
 	cont_t *cont;
 
 	Newx(cont, 1, cont_t);
-	init_cont(cont);
+	init_cont(aTHX_ cont);
 
 	return cont;
 }
@@ -970,12 +992,13 @@ static void destroy_cont (pTHX_ cont_t *cont) {
 static void invoke_hook (pTHX) {
 	dSP;
 	I32 i;
+	dMY_CXT;
 
 	trace("invoking\n");
 
 	trace("SP=%p, MARK=%d\n", SP, TOPMARK);
 
-	restore_cont(MY_CXT.cont, MY_CXT.retop);
+	restore_cont(aTHX_ MY_CXT.cont, MY_CXT.retop);
 	MY_CXT.cont = NULL;
 	MY_CXT.retop = NULL;
 
@@ -1012,6 +1035,8 @@ XS(XS_Continuation__Delimited_cont_invoke)
 #else
 	dXSARGS;
 #endif
+	dMY_CXT;
+
 	/* stash the arguments */
 	trace("stashing args, SP=%p, items=%d\n", SP, items);
 	SP -= items;
@@ -1043,7 +1068,7 @@ static CV *cont_to_cv (pTHX_ cont_t *cont) {
 static void stackdump (pTHX) {
 	delim_t delim;
 	//printf("====orz\n");
-	init_delim(&delim);
+	init_delim(aTHX_ &delim);
 	print_delim(&delim);
 	printf("curpad=%p comppad=%p\n", PL_curpad, PL_comppad);
 	//sv_dump((SV *)PL_comppad);
@@ -1083,6 +1108,8 @@ BOOT:
 void
 cont_shift (CV *block)
 	PROTOTYPE: &
+	PREINIT:
+		dMY_CXT;
 	PPCODE:
 		/* these operations should execute without the XSUB scope, and unwinding it is
 		 * tricky so we use SAVEDESTRUCTOR_x to override PL_op. This lets us execute
@@ -1101,6 +1128,8 @@ cont_shift (CV *block)
 void
 cont_reset (CV *block)
 	PROTOTYPE: &
+	PREINIT:
+		dMY_CXT;
 	PPCODE:
 		MY_CXT.block = block;
 		SvREFCNT_inc(block);
