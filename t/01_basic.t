@@ -3,9 +3,9 @@
 use strict;
 use warnings;
 
-use Test::More tests => 11;
+use Test::More tests => 16;
 
-use ok 'Continuation::Delimited' => qw(cont_reset);
+use ok 'Continuation::Delimited' => qw(cont_reset cont_shift);
 
 my $x = cont_reset {
 	pass("reset called");
@@ -31,4 +31,35 @@ is( cont_reset { foo("blah") }, "foo", "sub calls" );
 is( cont_reset { !wantarray }, 1, "scalar context" );
 is_deeply( [ cont_reset { wantarray } ], [ 1 ], "list context" );
 cont_reset { is( wantarray, undef, "void context") };
+
+
+is(
+	cont_reset {
+		cont_shift { 42 };
+		fail("not reached");
+		return "foo";
+	},
+	42,
+	"escape continuation",
+);
+
+
+my $after = 0;
+
+my $value = cont_reset {
+	pass("reset called");
+    my $x = cont_shift {
+		pass("shift called");
+		my $k = shift;
+		$k->(7);
+    };
+
+	is($after, 0, "resumed immediately");
+
+	return 3 + $x;
+};
+
+$after++;
+
+is($value, 10, "noop continuation");
 
