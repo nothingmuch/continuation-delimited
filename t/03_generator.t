@@ -56,14 +56,10 @@ $^D="";
 
 my $gen = generator {
 	warn "in generator";
-	Continuation::Delimited::stk();
-	for ( 1 .. 3 ) {
-		warn "in loop, $_";
-		Continuation::Delimited::stk();
-		yield($_); # FIXME check that yield returns the right thing
-		warn "returned from loop";
-		Continuation::Delimited::stk();
-	}
+	yield(1);
+	yield(2);
+	yield(3);
+	#yield($_) for 1 .. 3; # FIXME check that yield returns the right thing
 
 	return "finished";
 };

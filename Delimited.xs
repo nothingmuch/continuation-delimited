@@ -310,7 +310,7 @@ static void init_cont_cxs (pTHX_ cont_t *cont) {
 	debug(cont->cvs = newAV());
 	/* save scope objects, and also pads */
 
-	cont->cxs_len    = end->cxs - start->cxs;
+	cont->cxs_len = end->cxs - start->cxs;
 
 	/* relocate the contexts */
 	if ( cont->cxs_len ) {
@@ -347,14 +347,18 @@ static void init_cont_cxs (pTHX_ cont_t *cont) {
 
 					debug(av_push(cont->cvs, SvREFCNT_inc(cv)));
 
+					/* POPSUB but without destroying @_ */
+					if (cx->blk_sub.hasargs) {
+						trace("@_=%p, pad0=%p, argarray=%p\n", GvAV(PL_defgv), AvARRAY(pad)[0], cx->blk_sub.argarray);
+						// assert(GvAV(PL_defgv) == AvARRAY(pad)[0]);
+						POP_SAVEARRAY();
+
+						if (!AvREAL(cx->blk_sub.argarray)) {
+							CLEAR_ARGARRAY(cx->blk_sub.argarray);
+						}
+					}
 					CvDEPTH(cv) = cx->blk_sub.olddepth;
 
-					/* 0 based offset logic for non reified @_ */
-					if ( !AvREAL(cx->blk_sub.argarray) ) {
-						trace("non reified @_\n"); /* FIXME not finished */
-						CLEAR_ARGARRAY(cx->blk_sub.argarray);
-					}
-					
 					break;
 
 				case CXt_LOOP:
@@ -613,7 +617,7 @@ static void init_cont_state (pTHX_ cont_t *cont) {
 	/* SAVEDESTRUCTOR_X is captured inside the continuation, so we detach this
 	 * delimiter chain */
 	MY_CXT.last_mark = cont->start->prev;
-
+	cont->start->prev = NULL;
 }
 
 /* move everything (destructively) from the last delimiter into a reified
@@ -666,7 +670,6 @@ static void restore_cont (pTHX_ cont_t *cont, OP *retop) {
 	trace("restoring\n");
 
 	push_delim();
-	print_delim(MY_CXT.last_mark);
 
 	trace("top save: %d\n", PL_savestack[PL_savestack_ix - 1].any_i32);
 	trace("top scope: %d, save ix=%d\n", PL_scopestack[PL_scopestack_ix - 1], PL_savestack_ix);
@@ -756,10 +759,13 @@ static void restore_cont (pTHX_ cont_t *cont, OP *retop) {
 								/* FIXME clone sv */
 
 								if ( sigil == '@' ) {
+									trace("faking clone of AV\n");
 									new = (SV *)newAV();
 								} else if ( sigil == '%' ) {
+									trace("faking clone of HV\n");
 									new = (SV *)newHV();
 								} else {
+									trace("faking clone of SV\n");
 									new = newSVsv(sv);
 								}
 							}
@@ -772,14 +778,15 @@ static void restore_cont (pTHX_ cont_t *cont, OP *retop) {
 								case SVt_PVIV:
 								case SVt_PVNV:
 								case SVt_RV:
+									trace("clone tmp sv\n");
 									new = newSVsv(sv);
 									break;
 								case SVt_PVAV:
-									trace("clone array\n");
+									trace("clone tmp array\n");
 									new = (SV *)newAV();
 									break;
 								case SVt_PVHV:
-									trace("clone hash\n");
+									trace("clone tmp hash\n");
 									new = (SV *)newHV();
 									break;
 								default:
@@ -792,11 +799,16 @@ static void restore_cont (pTHX_ cont_t *cont, OP *retop) {
 						av_store(copy, i, new);
 					}
 
+					/* recreate @_ FIXME clone the proto pad's 0 slot */
 					args = newAV();
+					/* FIXME AvREAL shit */
 					av_store(copy, 0, (SV *)args); /* FIXME what does pad_push do? */
-					cx->blk_sub.savearray = GvAV(PL_defgv);
-					GvAV(PL_defgv) = (AV *)SvREFCNT_inc_simple(args);
-					cx->blk_sub.argarray = args;
+
+					if ( cx->blk_sub.hasargs ) {
+						cx->blk_sub.savearray = GvAV(PL_defgv);
+						GvAV(PL_defgv) = (AV *)SvREFCNT_inc_simple(args);
+						cx->blk_sub.argarray = args;
+					}
 
 					/* FIXME need to work out sp/mark from oldsp and friends to count args and copy */
 
@@ -825,6 +837,7 @@ static void restore_cont (pTHX_ cont_t *cont, OP *retop) {
 
 				break;
 			case CXt_LOOP:
+				trace("loop\n");
 				/* FIXME ITERVAR and ITERARRAY through pointertable for clones */
 #ifndef USE_ITHREADS
 				if ( CxITERVAR(cx) ) {
@@ -848,6 +861,8 @@ static void restore_cont (pTHX_ cont_t *cont, OP *retop) {
 				break;
 
 			default:
+				trace("some other CX type\n");
+				cx_dump(cx);
 				break;
 		}
 	}
@@ -1042,10 +1057,10 @@ static CV *cont_to_cv (pTHX_ cont_t *cont) {
 
 static void stackdump (pTHX) {
 	delim_t delim;
-	//printf("====orz\n");
+	//trace("====orz\n");
 	init_delim(&delim);
 	print_delim(&delim);
-	printf("curpad=%p comppad=%p\n", PL_curpad, PL_comppad);
+	trace("curpad=%p comppad=%p\n", PL_curpad, PL_comppad);
 	//sv_dump((SV *)PL_comppad);
 	//debstack();
 }
@@ -1053,12 +1068,8 @@ static void stackdump (pTHX) {
 static void cont_shift_hook (pTHX) {
 	dSP;
 
-	stackdump(aTHX);
 	cont_t *cont = create_cont(aTHX);
 	CV *cont_cv = cont_to_cv(aTHX_ cont);
-
-	sv_dump(cont_cv);
-	stackdump(aTHX);
 
 	/* create_cont modifies the stacks */
 	SPAGAIN;
