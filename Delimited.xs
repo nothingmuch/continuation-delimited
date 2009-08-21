@@ -276,7 +276,8 @@ static void init_cont_stack (pTHX_ cont_t *cont) {
 	/* make sure all the values are refcounted in the */
 	trace("stack len: %d\n", stack_len);
 	for ( i = 0; i < stack_len; i++ ) {
-		SV *sv = PL_stack_base[start->stack + i];
+		trace("i=%d=%p sp=%p\n", i, &PL_stack_base[start->stack + i + 1], PL_stack_sp);
+		SV *sv = PL_stack_base[start->stack + i + 1];
 		SvREFCNT_inc(sv);
 		av_push(stack, sv);
 	}
@@ -287,7 +288,10 @@ static void init_cont_stack (pTHX_ cont_t *cont) {
 		Newx(cont->marks, cont->marks_len, I32);
 
 		for ( i = 0; i < cont->marks_len; i++) {
-			cont->marks[i] = PL_markstack[i + start->marks] - start->stack;
+			trace("i=%d=%p mark ptr=%p\n", i, &PL_markstack[start->stack + i + 1], PL_markstack_ptr);
+
+			cont->marks[i] = PL_markstack[1 + i + start->marks] - start->stack;
+			trace("mark: %d (sp=%p, start=%d, orig=%d),\n", cont->marks[i], PL_stack_sp, start->stack, PL_markstack[1+i+start->marks]);
 		}
 	} else {
 		cont->marks = NULL;
@@ -416,7 +420,7 @@ static void init_cont_saves (pTHX_ cont_t *cont) {
 
 	trace("start_saves=%d\n", start->saves);
 	trace("start_scopes=%d\n", start->scopes);
-	
+
 	/* we need to copy the save stack one by one from the end to the begining,
 	 * because the last element is what denotes the type */
 
@@ -661,9 +665,6 @@ void save_delim (pTHX_ void *ptr) {
  * this operation should be invokable multiple times */
 static void restore_cont (pTHX_ cont_t *cont, OP *retop) {
 	I32 i, end;
-	dSP;
-	SV **stack = AvARRAY(cont->stack);
-	I32 stack_len = av_len(cont->stack) + 1;
 	PTR_TBL_t *cloned = ptr_table_new();
 	I32 pads;
 
@@ -826,8 +827,8 @@ static void restore_cont (pTHX_ cont_t *cont, OP *retop) {
 						trace("mapped: %p\n", cx->blk_sub.oldcomppad);
 					} else {
 						trace("BAAAA\n");
-						sv_dump(cx->blk_sub.oldcomppad);
-						sv_dump(cv);
+						//sv_dump(cx->blk_sub.oldcomppad);
+						//sv_dump(cv);
 					}
 
 					if ( pad_av == cont->end->comppad ) {
@@ -942,12 +943,15 @@ static void restore_cont (pTHX_ cont_t *cont, OP *retop) {
 	ptr_table_free(cloned);
 
 	for ( i = 0; i < cont->marks_len; i++ ) {
-		PUSHMARK( SP + cont->marks[i] );
+		PUSHMARK( PL_stack_sp + cont->marks[i] );
 	}
 
-	if ( stack_len ) {
+	if ( av_len(cont->stack) > -1 ) {
+		dSP;
+		I32 stack_len = av_len(cont->stack) + 1;
+
 		EXTEND(SP, stack_len);
-		Copy(stack, SP + 1, stack_len, SV *);
+		Copy(AvARRAY(cont->stack), SP + 1, stack_len, SV *);
 		SP += stack_len;
 
 		PUTBACK;
@@ -1002,7 +1006,6 @@ static void invoke_hook (pTHX) {
 
 	EXTEND(SP, MY_CXT.items);
 
-	PUSHMARK(SP);
 	for ( i = 0; i < MY_CXT.items; i++ ) {
 		SV *sv = MY_CXT.args[i];
 
