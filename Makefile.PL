@@ -4,6 +4,8 @@ use ExtUtils::MakeMaker;
 WriteMakefile(
     NAME              => 'Continuation::Delimited',
     VERSION_FROM      => 'lib/Continuation/Delimited.pm',
-    PREREQ_PM         => {},
-	SIGN              => 1,
+    PREREQ_PM         => {
+	'Test::use::ok' => '0.0.2'
+    },
+    SIGN              => 1,
 );
