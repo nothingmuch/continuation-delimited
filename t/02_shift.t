@@ -58,3 +58,25 @@ is( $invoked, 3, "invoked three times" );
 is( $created, 1, "shift not reinvoked" );
 is( $after, 1, "reset retop not reinvoked" );
 is( $count, 10, "count var updated" );
+
+sub foo { 3 + cont_shift { return $_[0] } }
+
+my $add_foo = cont_reset { foo() };
+
+is( $add_foo->(7), 10, "Add with a sub" );
+is( $add_foo->(4), 8, "Add with a sub" );
+
+sub bar { $_[0] + cont_shift { return $_[0] } }
+
+my $add_bar = cont_reset { bar(4) };
+
+is( $add_bar->(7), 11, "Add with a sub using \@_" );
+is( $add_bar->(4), 9, "Add with a sub using \@_" );
+
+sub baz { my $add = shift; $add + cont_shift { return $_[0] } }
+
+my $add_baz = cont_reset { baz(2) };
+
+is( $add_baz->(7), 9, "Add with a sub using lexical" );
+is( $add_baz->(4), 6, "Add with a sub using lexical" );
+
