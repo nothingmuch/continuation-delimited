@@ -3,7 +3,7 @@
 use strict;
 use warnings;
 
-use Test::More tests => 42;
+use Test::More tests => 56;
 
 use ok 'Continuation::Delimited' => qw(cont_reset cont_shift);
 
@@ -107,8 +107,8 @@ is( ref $add_baz, "CODE", "captured cont" );
 is( $add_baz->(7), 14, "Add with a sub using lexical" );
 is( $add_baz->(10), 17, "Add with a sub using lexical" );
 
-sub my_shift { cont_shift { return $_[0] }; }
-sub zot { my $x = $_[0]; return $x + my_shift() }
+sub my_shift { cont_shift { return $_[0] } }
+sub zot { my $x = $_[0]; $x += my_shift(); return $x } # tests that $x is cloned on the stack
 sub make_zot { cont_reset { zot(13) } };
 
 my $add_zot = make_zot();
@@ -121,3 +121,36 @@ my $z = $add_zot->(7);
 
 is( $z, 20, "Add with a nested sub" );
 is( $add_zot->(5), 18, "Add with a nested sub" );
+is( $add_zot->(20), 33, "Add with a nested sub" );
+
+{
+	my ( @log, $end );
+
+	sub steps {
+		cont_reset {
+			push @log, my_shift(); # sub { cont_shift { return $_[0] } }->(); # the second form works, the first fails (pad screwups?)
+			push @log, my_shift();
+			push @log, my_shift();
+			$end++;
+			return "end";
+		}
+	}
+
+	ok( !$end, "didn't end yet" );
+	is( ref(my $k = steps()), "CODE", "got cont" );
+	is_deeply( \@log, [], "log" );
+
+	ok( !$end, "didn't end yet" );
+	is( ref($k = $k->("one")), "CODE", "next cont" );
+	is_deeply( \@log, [qw(one)], "log" );
+
+	ok( !$end, "didn't end yet" );
+	is( ref($k = $k->("two")), "CODE", "next cont" );
+	is_deeply( \@log, [qw(one two)], "log" );
+
+	ok( !$end, "didn't end yet" );
+	is( $k->("three"), "end", "end" );
+	is_deeply( \@log, [qw(one two three)], "log" );
+	ok( $end, "end set" );
+
+}
