@@ -398,6 +398,126 @@ static void init_cont_cxs (pTHX_ cont_t *cont) {
 	cont->cxs = cxs;
 }
 
+static void copy_save_frame (pTHX_ delim_t *start, ANY **saves_ptr_ptr, ANY **repeat_ptr_ptr, ANY **defer_ptr_ptr) {
+	I32 i;
+	ANY *saves_ptr = *saves_ptr_ptr;
+	ANY *repeat_ptr = *repeat_ptr_ptr;
+	ANY *defer_ptr = *defer_ptr_ptr;
+
+	switch (saves_ptr->any_i32) {
+		/* repeated entries, recreated during restore_cont */
+		case SAVEt_COMPPAD:
+			/* SSCHECK(2) */
+			trace("repeat comppad %p\n", *(saves_ptr -1));
+		case SAVEt_CLEARSV:
+			*--repeat_ptr = *saves_ptr--;
+			*--repeat_ptr = *saves_ptr--;
+			break;
+
+		case SAVEt_STACK_POS:
+			trace("repeat stack pos\n");
+			/* SSCHECK(2) */
+			*--repeat_ptr = *saves_ptr--;
+			repeat_ptr--;
+			repeat_ptr->any_i32 = saves_ptr->any_i32 - start->stack; /* 0 based */
+			saves_ptr--;
+			break;
+
+		case SAVEt_STACK_CXPOS:
+			/* SSCHECK(2) */
+			trace("repeat cxspos\n");
+			*--repeat_ptr = *saves_ptr--;
+			repeat_ptr--;
+			repeat_ptr->any_i32 = saves_ptr->any_i32 - start->cxs; /* 0 based */
+			saves_ptr--;
+			break;
+
+			/* deferred entries, happen at destruction */
+		case SAVEt_SET_SVFLAGS:
+		case SAVEt_PADSV:
+		case SAVEt_DELETE:
+		case SAVEt_AELEM:
+		case SAVEt_HELEM:
+		case SAVEt_HINTS:
+			/* SSCHECK(4) */
+			trace("Size 4\n");
+			*--defer_ptr = *saves_ptr--;
+			/* fall through */
+		case SAVEt_ITEM:
+		case SAVEt_SV:
+		case SAVEt_AV:
+		case SAVEt_HV:
+		case SAVEt_INT:
+		case SAVEt_LONG:
+		case SAVEt_I32:
+		case SAVEt_IV:
+		case SAVEt_SPTR:
+		case SAVEt_APTR:
+		case SAVEt_HPTR:
+		case SAVEt_PPTR:
+		case SAVEt_SVREF:
+		case SAVEt_GP:
+		case SAVEt_I16:
+		case SAVEt_GENERIC_SVREF:
+		case SAVEt_DESTRUCTOR_X:
+		case SAVEt_VPTR:
+		case SAVEt_I8:
+		case SAVEt_GENERIC_PVREF:
+		case SAVEt_SHARED_PVREF:
+		case SAVEt_BOOL:
+		case SAVEt_SAVESWITCHSTACK: /* FIXME should this be supported at all? */
+		case SAVEt_COP_ARYBASE:
+			/* SSCHECK(3) */
+			trace("Size 3\n");
+			*--defer_ptr = *saves_ptr--;
+			/* FIXME skip SAVETMPS? if ( saves_ptr->any_ptr == &PL_tmps_floor ) */
+			/* fall through */
+		case SAVEt_NSTAB:
+		case SAVEt_FREESV:
+		case SAVEt_FREEOP:
+		case SAVEt_FREEPV:
+		case SAVEt_DESTRUCTOR:
+		case SAVEt_REGCONTEXT:
+		case SAVEt_OP:
+		case SAVEt_MORTALIZESV:
+		case SAVEt_COMPILE_WARNINGS:
+		case SAVEt_PARSER:
+			/* SSCHECK(2) */
+			trace("Size 2\n");
+			*--defer_ptr = *saves_ptr--;
+			*--defer_ptr = *saves_ptr--;
+			trace("deferred %p\n", saves_ptr);
+			break;
+
+		case SAVEt_ALLOC:
+			/* SSCHECK(elems + 2) */
+			*--defer_ptr = *saves_ptr--;
+			i = saves_ptr->any_i32 + 1; /* this is elems */
+			defer_ptr -= i;
+			saves_ptr -= i;
+			Copy(saves_ptr, defer_ptr, i, ANY);
+			trace("Deferred alloc %p\n", saves_ptr);
+			break;
+
+		case SAVEt_RE_STATE:
+			/* SSGROW(SAVESTACK_ALLOC_FOR_RE_SAVE_STATE + 1) */
+			saves_ptr -= SAVESTACK_ALLOC_FOR_RE_SAVE_STATE + 1;
+			defer_ptr -= SAVESTACK_ALLOC_FOR_RE_SAVE_STATE + 1;
+			Copy(saves_ptr, defer_ptr, SAVESTACK_ALLOC_FOR_RE_SAVE_STATE + 1, ANY);
+			trace("Deferred re state %p\n", saves_ptr);
+			break;
+
+		default:
+			croak("unknown save type: %d\n", saves_ptr->any_i32);
+	}
+
+	assert((*saves_ptr_ptr - saves_ptr) == (*defer_ptr_ptr - defer_ptr) + (*repeat_ptr_ptr - repeat_ptr));
+
+	*saves_ptr_ptr = saves_ptr;
+	*repeat_ptr_ptr = repeat_ptr;
+	*defer_ptr_ptr = defer_ptr;
+}
+
 static void init_cont_saves (pTHX_ cont_t *cont) {
 	delim_t *start = cont->start;
 	delim_t *end   = cont->end;
@@ -415,8 +535,12 @@ static void init_cont_saves (pTHX_ cont_t *cont) {
 
 	I32 saves_len = end->saves - start->saves;
 
+	assert(saves_len <= PL_savestack_ix );
+
 	cont->tmps_len   = end->tmps   - start->tmps;
 	cont->scopes_len = end->scopes - start->scopes;
+
+	assert(cont->scopes_len <= PL_scopestack_ix );
 
 	/* wasteful I guess, but who cares */
 	Newx(cont->defer_saves,   saves_len, ANY);
@@ -424,22 +548,23 @@ static void init_cont_saves (pTHX_ cont_t *cont) {
 	Newx(cont->scopes,        cont->scopes_len, I32);
 
 	/* source iterators */
-	scopes_ptr = &PL_scopestack[PL_scopestack_ix - 1];
-	saves_ptr  = &PL_savestack[PL_savestack_ix - 1];
+	scopes_ptr = &PL_scopestack[end->scopes - 1];
+	saves_ptr  = &PL_savestack[end->saves - 1];
 
 	/* dest iterators, these are preincremented on assignment so they don't have a -1 */
 	defer_ptr  = &cont->defer_saves[saves_len];
 	repeat_ptr = &cont->repeat_saves[saves_len];
 	scopes     = &cont->scopes[cont->scopes_len];
 
-	trace("start_saves=%d\n", start->saves);
-	trace("start_scopes=%d\n", start->scopes);
+	trace("start_saves=%d end=%d\n", start->saves, end->saves);
+	trace("start_scopes=%d end=%d\n", start->scopes, end->scopes);
+	trace("first save=%d last=%d\n", PL_scopestack[start->scopes], PL_scopestack[end->scopes]);
 
 	/* we need to copy the save stack one by one from the end to the begining,
 	 * because the last element is what denotes the type */
 
 	while ( scopes_ptr >= &PL_scopestack[start->scopes] ) {
-		trace("scopes_ptr=%p, base=%p (%d), end=%p\n", scopes_ptr, &PL_scopestack[start->scopes], scopes_ptr - &PL_scopestack[start->scopes], &PL_scopestack[PL_scopestack_ix]);
+		trace("scopes_ptr=%p (%d), base=%p (%d), end=%p\n", scopes_ptr, *scopes_ptr, &PL_scopestack[start->scopes], scopes_ptr - &PL_scopestack[start->scopes], &PL_scopestack[PL_scopestack_ix]);
 		/* iterate all the saves for a given scope
 		 *
 		 * the entries that involve properly unwinding are moved to the repeat
@@ -452,151 +577,80 @@ static void init_cont_saves (pTHX_ cont_t *cont) {
 		 * (these are the entries that e.g. free storage space (DESTRUCTOR_X)
 		 * etc.
 		 * */
-		while ( saves_ptr >= &PL_savestack[*scopes_ptr] ) {
+
+		assert(saves_ptr >= &PL_savestack[PL_scopestack[start->scopes]]);
+		assert(saves_ptr >= &PL_savestack[*scopes_ptr]);
+
+		while ( saves_ptr > &PL_savestack[*scopes_ptr] ) {
 			trace("scopes ptr=%p, index=%d, scope_base=%p, savestack=%p\n", scopes_ptr, *scopes_ptr, &PL_savestack[*scopes_ptr], PL_savestack);
 			trace("repeat_ptr=%p, defer_ptr=%p, saves_ptr=%p\n", repeat_ptr, defer_ptr, saves_ptr);
 
 			trace("save entry: %d\n",saves_ptr->any_i32); 
-			switch (saves_ptr->any_i32) {
-				/* repeated entries, recreated during restore_cont */
-				case SAVEt_COMPPAD:
-					/* SSCHECK(2) */
-					trace("repeat comppad %p\n", *(saves_ptr -1));
-				case SAVEt_CLEARSV:
-					*--repeat_ptr = *saves_ptr--;
-					*--repeat_ptr = *saves_ptr--;
-					break;
 
-				case SAVEt_STACK_POS:
-					trace("repeat stack pos\n");
-					/* SSCHECK(2) */
-					*--repeat_ptr = *saves_ptr--;
-					repeat_ptr--;
-					repeat_ptr->any_i32 = saves_ptr->any_i32 - start->stack; /* 0 based */
-					saves_ptr--;
-					break;
-
-				case SAVEt_STACK_CXPOS:
-					/* SSCHECK(2) */
-					trace("repeat cxspos\n");
-					*--repeat_ptr = *saves_ptr--;
-					repeat_ptr--;
-					repeat_ptr->any_i32 = saves_ptr->any_i32 - start->cxs; /* 0 based */
-					saves_ptr--;
-					break;
-
-				/* deferred entries, happen at destruction */
-				case SAVEt_SET_SVFLAGS:
-				case SAVEt_PADSV:
-				case SAVEt_DELETE:
-				case SAVEt_AELEM:
-				case SAVEt_HELEM:
-				case SAVEt_HINTS:
-					/* SSCHECK(4) */
-					trace("Size 4\n");
-					*--defer_ptr = *saves_ptr--;
-					/* fall through */
-				case SAVEt_ITEM:
-				case SAVEt_SV:
-				case SAVEt_AV:
-				case SAVEt_HV:
-				case SAVEt_INT:
-				case SAVEt_LONG:
-				case SAVEt_I32:
-				case SAVEt_IV:
-				case SAVEt_SPTR:
-				case SAVEt_APTR:
-				case SAVEt_HPTR:
-				case SAVEt_PPTR:
-				case SAVEt_SVREF:
-				case SAVEt_GP:
-				case SAVEt_I16:
-				case SAVEt_GENERIC_SVREF:
-				case SAVEt_DESTRUCTOR_X:
-				case SAVEt_VPTR:
-				case SAVEt_I8:
-				case SAVEt_GENERIC_PVREF:
-				case SAVEt_SHARED_PVREF:
-				case SAVEt_BOOL:
-				case SAVEt_SAVESWITCHSTACK: /* FIXME should this be supported at all? */
-				case SAVEt_COP_ARYBASE:
-					/* SSCHECK(3) */
-					trace("Size 3\n");
-					*--defer_ptr = *saves_ptr--;
-					/* FIXME skip SAVETMPS? if ( saves_ptr->any_ptr == &PL_tmps_floor ) */
-					/* fall through */
-				case SAVEt_NSTAB:
-				case SAVEt_FREESV:
-				case SAVEt_FREEOP:
-				case SAVEt_FREEPV:
-				case SAVEt_DESTRUCTOR:
-				case SAVEt_REGCONTEXT:
-				case SAVEt_OP:
-				case SAVEt_MORTALIZESV:
-				case SAVEt_COMPILE_WARNINGS:
-				case SAVEt_PARSER:
-					/* SSCHECK(2) */
-					trace("Size 2\n");
-					*--defer_ptr = *saves_ptr--;
-					*--defer_ptr = *saves_ptr--;
-					trace("deferred %p\n", saves_ptr);
-					break;
-
-				case SAVEt_ALLOC:
-					/* SSCHECK(elems + 2) */
-					*--defer_ptr = *saves_ptr--;
-					i = saves_ptr->any_i32 + 1; /* this is elems */
-					defer_ptr -= i;
-					saves_ptr -= i;
-					Copy(saves_ptr, defer_ptr, i, ANY);
-					trace("Deferred alloc %p\n", saves_ptr);
-					break;
-
-				case SAVEt_RE_STATE:
-					/* SSGROW(SAVESTACK_ALLOC_FOR_RE_SAVE_STATE + 1) */
-					saves_ptr -= SAVESTACK_ALLOC_FOR_RE_SAVE_STATE + 1;
-					defer_ptr -= SAVESTACK_ALLOC_FOR_RE_SAVE_STATE + 1;
-					Copy(saves_ptr, defer_ptr, SAVESTACK_ALLOC_FOR_RE_SAVE_STATE + 1, ANY);
-					trace("Deferred re state %p\n", saves_ptr);
-					break;
-
-				default:
-					croak("unknown save type: %d\n", saves_ptr->any_i32);
-			}
+			copy_save_frame(aTHX_ start, &saves_ptr, &repeat_ptr, &defer_ptr);
 		}
 
+		assert(saves_ptr == &PL_savestack[*scopes_ptr - 1]);
+
 		/* now create a new scopes entry for the repeat stack only (at
-		 * destruction we unwind everything as a single scope) 
+		 * destruction we unwind everything in the defers as a single scope) 
 		 *
 		 * the save entry is actually bogus, we need to convert it into a zero
 		 * based offsets based on the differences at the end, but we don't yet
-		 * know how many elements we'll end up with, so we keep a pointer for
-		 * now */
+		 * know how many elements we'll end up with, so we keep the pointer
+		 * value for now */
 
-		trace("scope end, %p, %d\n", repeat_ptr, (I32)repeat_ptr);
-		*--scopes = (I32)repeat_ptr;
+		trace("scope end, %p, %d, orig=%d (%p)\n", repeat_ptr, (I32)repeat_ptr, *scopes_ptr - start->saves, &PL_savestack[*scopes_ptr]);
+		*--scopes = repeat_ptr - cont->repeat_saves;
 		scopes_ptr--;
 	}
+
+	/* all scopes were copied */
+	assert(scopes == cont->scopes);
+	assert(scopes_ptr == &PL_scopestack[start->scopes - 1]);
+
+	/* all saves of all scopes were copied */
+	assert(saves_ptr == &PL_savestack[PL_scopestack[start->scopes] - 1]);
+
+	/* copy any remaining SAVEs that were created between reset { and ENTER */
+	while ( saves_ptr > &PL_savestack[start->saves] ) {
+		copy_save_frame(aTHX_ start, &saves_ptr, &repeat_ptr, &defer_ptr);
+	}
+
+	/* all saves were copied */
+	assert(saves_ptr == &PL_savestack[start->saves - 1]);
+
+	/* no overflows */
+	assert(repeat_ptr >= cont->repeat_saves);
+	assert(defer_ptr  >= cont->defer_saves);
+
+	/* correct number of SAVEt's + associated data */
+	trace("ptrs: %d + %d == %d\n", (&cont->repeat_saves[saves_len] - repeat_ptr), (&cont->defer_saves[saves_len] - defer_ptr), saves_len);
+	assert((&cont->repeat_saves[saves_len] - repeat_ptr) + (&cont->defer_saves[saves_len] - defer_ptr) == saves_len);
 
 	trace("saves len=%d, repeat_ptr=%p, repeat_saves=%p (%d)\n", saves_len, repeat_ptr, cont->repeat_saves, repeat_ptr - cont->repeat_saves );
 	cont->repeat_len = saves_len - ( repeat_ptr - cont->repeat_saves );
 	cont->defer_len  = saves_len - ( defer_ptr  - cont->defer_saves  );
 
-	trace("relocating\n");
-	/* relocate the copied stacks to the begining of their buffers */
-	// Move(repeat_ptr, cont->repeat_saves, cont->repeat_len, ANY);
-	//Move(defer_ptr,  cont->defer_saves,  cont->defer_len,  ANY);
-
-	// FIXME leaks, relocate the data or add another pointer
-	cont->repeat_saves = repeat_ptr;
-	cont->defer_saves  = defer_ptr;
+	assert(cont->repeat_len + cont->defer_len == saves_len);
 
 	/* correct the savestack indices for the relative locations, now that we know where the begining is */
 	for ( i = 0; i < cont->scopes_len; i++ ) {
-		trace("scope %d = %d, %d\n", i, cont->scopes[i]);
-		cont->scopes[i] -= (I32)repeat_ptr;
-		trace("scope %d = %d, %d\n", i, cont->scopes[i]);
+		cont->scopes[i] -= repeat_ptr - cont->repeat_saves;
+		trace("scope %d = %d, orig = %d\n", i, cont->scopes[i], PL_scopestack[start->scopes + i] - start->saves);
+		assert(cont->scopes[i] <= PL_scopestack[start->scopes + i] - start->saves);
+
+		/* ensure there are fewer SAVEt entries per frame in the filtered savestack than there were in the original */
+		debug(if (i) trace("delta=%d, orig delta=%d\n", (cont->scopes[i] - cont->scopes[i-1]), (PL_scopestack[start->scopes + i] - PL_scopestack[start->scopes + i - 1])));
+		assert(i == 0 || ( (cont->scopes[i] - cont->scopes[i-1]) <= (PL_scopestack[start->scopes + i] - PL_scopestack[start->scopes + i - 1]) ));
 	}
+
+	trace("relocating\n");
+	/* relocate the copied stacks to the begining of their buffers */
+	//memmove(repeat_ptr, cont->repeat_saves, cont->repeat_len * sizeof(ANY));
+	//memmove(defer_ptr,  cont->defer_saves,  cont->defer_len  * sizeof(ANY));
+	cont->repeat_saves = repeat_ptr; /* FIXME leaks */
+	cont->defer_saves = defer_ptr; /* FIXME leaks */
 
 	PL_tmps_ix       = start->tmps;
 	PL_savestack_ix  = start->saves;
@@ -738,7 +792,7 @@ static void restore_cont (pTHX_ cont_t *cont, OP *retop) {
 		cx->blk_oldscopesp += PL_scopestack_ix;
 
 		trace("cx %d type=%d\n", cxstack_ix, CxTYPE(cx));
-		debug(cx_dump(cx));
+		//debug(cx_dump(cx));
 
 		switch ( CxTYPE(cx) ) {
 			case CXt_SUB:
@@ -900,12 +954,9 @@ static void restore_cont (pTHX_ cont_t *cont, OP *retop) {
 	}
 
 	for ( i = 0; i < cont->scopes_len; i++ ) {
+		trace("i=%d, savestack-ix=%d, scope=%d\n", i, PL_savestack_ix, cont->scopes[i]);
 		PL_scopestack[PL_scopestack_ix++] = PL_savestack_ix + cont->scopes[i];
 	}
-	trace("scopescack_ix=%d\n", PL_scopestack_ix);
-	trace("top save: %d\n", PL_savestack[PL_savestack_ix - 1].any_i32);
-	trace("top scope: %d, save ix=%d\n", PL_scopestack[PL_scopestack_ix - 1], PL_savestack_ix);
-
 
 	if ( cont->repeat_len ) {
 		/* FIXME fixup SAVECOMPPAD entries, fix 0 based offsets */
@@ -926,9 +977,15 @@ static void restore_cont (pTHX_ cont_t *cont, OP *retop) {
 						trace("top savet comppad %p\n", PL_comppad);
 						PL_savestack[i].any_ptr = PL_comppad;
 					} else {
-						trace("savet comppad %p -> %p\n", PL_savestack[i].any_ptr, ptr_table_fetch(cloned, PL_savestack[i].any_ptr));
-						PL_savestack[i].any_ptr = ptr_table_fetch(cloned, PL_savestack[i].any_ptr);// || PL_savestack[i].any_ptr; /* FIXME is this wrong? */
-						assert(PL_savestack[i].any_ptr);
+						SV *mapped = ptr_table_fetch(cloned, PL_savestack[i].any_ptr);
+						assert(mapped);
+						assert(SvTYPE(mapped) == SvTYPE((SV *)PL_savestack[i].any_ptr));
+						assert(SvTYPE(mapped) == SVt_PVAV);
+						assert(av_len((AV *)mapped) == av_len((AV *)PL_savestack[i].any_ptr));
+
+						trace("savet comppad %p -> %p\n", PL_savestack[i].any_ptr, mapped);
+
+						PL_savestack[i].any_ptr = mapped;
 					}
 
 					i--;
@@ -954,6 +1011,10 @@ static void restore_cont (pTHX_ cont_t *cont, OP *retop) {
 		PL_savestack_ix += cont->repeat_len;
 	}
 
+	trace("scopescack_ix=%d\n", PL_scopestack_ix);
+	trace("top save: %d\n", PL_savestack[PL_savestack_ix - 1].any_i32);
+	trace("top scope: %d, save ix=%d\n", PL_scopestack[PL_scopestack_ix - 1], PL_savestack_ix);
+
 
 	/* fixup PL_comppad to point to the cloned pad corresponding to the top of the stack */
 	trace("overwriting PL_comppad=%p from end comppad=%p to %p\n", PL_comppad, cont->end->comppad, ptr_table_fetch(cloned, cont->end->comppad));
@@ -961,22 +1022,30 @@ static void restore_cont (pTHX_ cont_t *cont, OP *retop) {
 	assert(PL_comppad);
 	PL_curpad = AvARRAY(PL_comppad);
 
-	ptr_table_free(cloned);
-
 	for ( i = 0; i < cont->marks_len; i++ ) {
 		PUSHMARK( PL_stack_sp + cont->marks[i] );
 	}
 
 	if ( av_len(cont->stack) > -1 ) {
 		dSP;
+		SV **stack = AvARRAY(cont->stack);
 		I32 stack_len = av_len(cont->stack) + 1;
 
 		EXTEND(SP, stack_len);
-		Copy(AvARRAY(cont->stack), SP + 1, stack_len, SV *);
-		SP += stack_len;
+
+		for ( i = 0; i < stack_len; i++ ) {
+			SV *sv = ptr_table_fetch(cloned, *stack);
+			if ( !sv ) sv = *stack;
+			trace("%p -> %p\n", *stack, sv);
+			SP++;
+			stack++;
+			*SP = sv;
+		}
 
 		PUTBACK;
 	}
+
+	ptr_table_free(cloned);
 }
 
 static cont_t *create_cont (pTHX) {
@@ -1088,6 +1157,7 @@ static void stackdump (pTHX) {
 	init_delim(aTHX_ &delim);
 	print_delim(&delim);
 	trace("curpad=%p comppad=%p\n", PL_curpad, PL_comppad);
+	sv_dump(PL_comppad);
 	//sv_dump((SV *)PL_comppad);
 	//debstack();
 }
@@ -1106,7 +1176,7 @@ static void cont_shift_hook (pTHX) {
 	push_block(aTHX);
 }
 
-#define TRAMPOLINE(hook) PUTBACK, setup_trampoline(aTHX_ hook);
+#define TRAMPOLINE(hook) PUTBACK, setup_trampoline(aTHX_ hook), XSRETURN(0)
 
 MODULE = Continuation::Delimited		PACKAGE = Continuation::Delimited
 
@@ -1136,8 +1206,6 @@ cont_shift (CV *block)
 
 		TRAMPOLINE(cont_shift_hook);
 
-		XSRETURN(0);
-
 void
 cont_reset (CV *block)
 	PROTOTYPE: &
@@ -1149,9 +1217,6 @@ cont_reset (CV *block)
 
 		TRAMPOLINE(push_delim);
 
-		XSRETURN(0);
-
 void stk ()
 	PPCODE:
-		//TRAMPOLINE(stackdump);
-		XSRETURN(0);
+		TRAMPOLINE(stackdump);
