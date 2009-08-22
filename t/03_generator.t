@@ -71,13 +71,19 @@ my $auto = generator {
 	return "finished";
 };
 
-my $loop = generator {
-	for my $i ( 1 .. 3 ) {
-		yield($i);
-	}
+sub range {
+	my ( $from, $to ) = @_;
 
-	return "finished";
+	return generator {
+		for my $i ( $from .. $to ) {
+			yield($i);
+		}
+
+		return "finished";
+	}
 };
+
+my $loop = range(1,3);
 
 # FIXME also test for interleaved generators
 
