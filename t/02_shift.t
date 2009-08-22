@@ -154,3 +154,8 @@ is( $add_zot->(20), 33, "Add with a nested sub" );
 	ok( $end, "end set" );
 
 }
+
+# FIXME
+# reset { reset { shift { shift { } } } } + composition of reversed stack frames
+# recursive continuations
+# corecursive continuations

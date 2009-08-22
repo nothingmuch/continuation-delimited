@@ -579,7 +579,7 @@ static void init_cont_saves (pTHX_ cont_t *cont) {
 		 * */
 
 		assert(saves_ptr >= &PL_savestack[PL_scopestack[start->scopes]]);
-		assert(saves_ptr >= &PL_savestack[*scopes_ptr]);
+		assert(saves_ptr >= &PL_savestack[*scopes_ptr - 1]);
 
 		while ( saves_ptr > &PL_savestack[*scopes_ptr] ) {
 			trace("scopes ptr=%p, index=%d, scope_base=%p, savestack=%p\n", scopes_ptr, *scopes_ptr, &PL_savestack[*scopes_ptr], PL_savestack);

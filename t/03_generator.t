@@ -3,7 +3,7 @@
 use strict;
 use warnings;
 
-use Test::More 'no_plan';
+use Test::More tests => 31;
 
 use ok 'Continuation::Delimited' => qw(cont_reset cont_shift);
 
@@ -72,7 +72,6 @@ my $auto = generator {
 };
 
 my $loop = generator {
-
 	for my $i ( 1 .. 3 ) {
 		yield($i);
 	}
