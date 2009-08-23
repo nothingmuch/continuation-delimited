@@ -13,30 +13,11 @@ use ok 'Continuation::Delimited' => qw(cont_reset cont_shift);
 my $fail = \"oh noes";
 sub amb_is_failure ($) { ref $_[0] and refaddr($_[0]) == refaddr($fail) }
 
-# returns $fail from the last cont_reset
-sub amb_backtrack () { cont_shift { return $fail } }
-
-# backtracks unless its arguments are true
-sub amb_assert ($) {
-	my $condition = shift;
-
-	amb_backtrack() unless $condition;
-
-	return $condition;
-}
-
-sub amb {
-	my $item = amb_call(@_);
-
-	if ( ref $item eq 'CODE' ) {
-		return $item->();
-	} else {
-		return $item;
-	}
-}
-
 sub amb_call {
 	my @items = @_;
+
+	# this could be optimized when the operation *is* deterministic:
+	# return $items[0] if @items == 1;
 
 	cont_shift {
 		my $k = shift;
@@ -47,7 +28,7 @@ sub amb_call {
 		# return these values
 		foreach my $item ( @items ) {
 			my $result = cont_reset {
-				# this expression is delimited for amb_backtrack to return
+				# this expression is delimited for backtracking to return
 				# $fail in $result
 				$k->($item);
 			};
@@ -57,11 +38,13 @@ sub amb_call {
 			}
 		}
 
-		# none of the items seemed to work, we need to backtrack further
+		# none of the items seemed to work (or none were provided), we need to
+		# backtrack further
 		return $fail;
 	}
-}	
+}
 
+# ambiguous evaluation context
 sub amb_find (&) {
 	my $block = shift;
 
@@ -71,6 +54,29 @@ sub amb_find (&) {
 		die "No solution";
 	} else {
 		return $result;
+	}
+}
+
+
+# convenience functions
+
+# backtracks unless its arguments are true
+sub amb_assert ($) {
+	my $condition = shift;
+
+	amb() unless $condition; # amb() with no arguments causes backtracking
+
+	return $condition;
+}
+
+# evaluates thunks
+sub amb {
+	my $item = amb_call(@_);
+
+	if ( ref $item eq 'CODE' ) {
+		return $item->();
+	} else {
+		return $item;
 	}
 }
 
