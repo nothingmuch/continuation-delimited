@@ -1,11 +1,26 @@
-use 5.010000;
-use ExtUtils::MakeMaker;
+use inc::Module::Install 0.91;
+
+use 5.008001;
+
+use ExtUtils::Depends;
+
+name 'Continuation-Delimited';
+all_from 'lib/Continuation/Delimited.pm';
+
+requires 'B::Hooks::XSUB::CallAsOp' => '0.01';
+build_requires 'B::Hooks::XSUB::CallAsOp' => '0.01';
+configure_requires 'B::Hooks::XSUB::CallAsOp' => '0.01';
+
+# minimum version that works on Win32+gcc
+configure_requires 'ExtUtils::Depends' => 0.302;
+
+test_requires 'Test::More' => '0.88';
+
+repository 'git://github.com/nothingmuch/continuation-delimited.git';
+
+my $pkg = ExtUtils::Depends->new('Continuation::Delimited', 'B::Hooks::XSUB::CallAsOp');
 
 WriteMakefile(
-    NAME              => 'Continuation::Delimited',
-    VERSION_FROM      => 'lib/Continuation/Delimited.pm',
-    PREREQ_PM         => {
-	'Test::use::ok' => '0.0.2'
-    },
-    SIGN              => 1,
+  $pkg->get_makefile_vars,
 );
+

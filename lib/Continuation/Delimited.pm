@@ -4,6 +4,8 @@ use 5.010000;
 use strict;
 use warnings;
 
+use B::Hooks::XSUB::CallAsOp;
+
 use Sub::Exporter -setup => {
 	exports => [qw(
 		cont_reset

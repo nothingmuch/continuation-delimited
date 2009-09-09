@@ -4,6 +4,8 @@
 
 #include "ppport.h"
 
+#include "hook_xsub_callasop.h"
+
 //#define DEBUG
 
 #ifdef DEBUG
@@ -83,12 +85,8 @@ typedef struct cont {
 typedef struct {
 	delim_t *last_mark;
 
-	OP fakeop;
-	UNOP trampoline;
-	OP *trampoline_PL_op;
-
-	CV *block;
-	void (*hook)(pTHX);
+	CV *saved_block;
+	OP *saved_op;
 
 	/* used in invoke */
 	SV **args;
@@ -135,102 +133,62 @@ static void print_cont (cont_t *cont) {
 
 }
 
+/* stashes PL_op before the trampoline hack. this allows cont_reset,
+ * cont_invoke and cont_shift to have a proper value for PL_op */
+static void save_op (pTHX) {
+	assert(MY_CXT.saved_op == NULL);
+	MY_CXT.saved_op = PL_op;
+}
 
+/* stashes a block for future invocation. Since the trampoline can't pass
+ * values using the stack, we have to save it temporarily. This is used by
+ * cont_reset { } and cont_shift { }'s calling convention */
+static void save_block (pTHX_ CV *block) {
+	assert(MY_CXT.saved_block == NULL);
+
+	MY_CXT.saved_block = block;
+	SvREFCNT_inc(block);
+}
+
+
+/* restore PL_op's state to what it was before the trampoline */
+static void restore_saved_op (pTHX) {
+	assert(MY_CXT.saved_op != NULL);
+
+	PL_op = MY_CXT.saved_op;
+
+	MY_CXT.saved_op = NULL;
+}
 
 /* pushes the stashed CV from MY_CXT for the entersub trampoline */
-static void push_block (pTHX) {
+static void push_saved_block (pTHX) {
 	dSP;
 	dMY_CXT;
 
-	assert(MY_CXT.block != NULL);
+	assert(MY_CXT.saved_block != NULL);
 
-	XPUSHs((SV *)MY_CXT.block);
+	XPUSHs((SV *)MY_CXT.saved_block);
 	PUTBACK;
 
-	MY_CXT.block = NULL;
+	MY_CXT.saved_block = NULL;
 }
 
 /* this is like an entersub ppaddr but lets us invoke a hook first. it's used
  * to inject a call to the blocks given to reset { } and shift { } without the
  * XSUB context on the stack */
-static OP *entersub_wrapper (pTHX) {
+static OP *invoke_saved_block_no_args (pTHX) {
 	dSP;
-	dMY_CXT;
 
-	bool entersub = MY_CXT.block != NULL;
+	PUSHMARK(SP);
+	push_saved_block(aTHX);
 
-	trace("entersub stack pos %p (%d)\n", PL_stack_sp, PL_stack_sp - PL_stack_base);
-
-	/* reset PL_op to what it should be (instead of the trampoline). this is
-	 * the entersub that invoked the XSUB, and it's only used for its ->op_next
-	 * by ENTERSUB below */
-	PL_op = MY_CXT.trampoline_PL_op;
-
-	if ( MY_CXT.hook ) {
-		MY_CXT.hook(aTHX);
-		MY_CXT.hook = NULL;
-	}
-
-	if ( MY_CXT.block ) {
-		/* push the block SV if it hasn't been pushed by the hook */
-		PUSHMARK(SP);
-		push_block(aTHX);
-	}
-
-	/* FIXME refactor */
-	if ( entersub ) {
-		trace("trampolining to entersub\n");
-		return PL_ppaddr[OP_ENTERSUB](aTHX);
-	} else {
-		return NORMAL;
-	}
+	return PL_ppaddr[OP_ENTERSUB](aTHX);
 }
 
 
 /* FIXME this should move into say B::Hooks::XSUB::CallAsOp or somesuch */
 
 /* setup PL_op to trampoline into a block without an XSUB context */
-
-#define TRAMPOLINE(hook) PUTBACK, setup_trampoline(aTHX_ hook), XSRETURN(0)
-
-static void setup_trampoline_cb (pTHX_ void *ptr) {
-	dMY_CXT;
-	int flags = GIMME_V;
-
-	trace("trigered stack pos %p (%d)\n", PL_stack_sp, PL_stack_sp - PL_stack_base);
-
-	Zero(&MY_CXT.trampoline, 1, UNOP);
-
-	if (!(flags & G_NOARGS))
-		MY_CXT.trampoline.op_flags |= OPf_STACKED;
-
-	MY_CXT.trampoline.op_flags |= ((flags & G_VOID) ? OPf_WANT_VOID :
-		(flags & G_ARRAY) ? OPf_WANT_LIST : OPf_WANT_SCALAR);
-
-	MY_CXT.trampoline.op_type = OP_ENTERSUB;
-	MY_CXT.trampoline.op_next = PL_op->op_next;
-	MY_CXT.trampoline.op_ppaddr = entersub_wrapper;
-
-	MY_CXT.trampoline_PL_op = PL_op;
-
-	/* ENTERSUB will return PL_op->op_next causing execution of the trampoline */
-	MY_CXT.fakeop.op_next = (OP *)&MY_CXT.trampoline;
-	PL_op = &MY_CXT.fakeop;
-}
-
-static void setup_trampoline (pTHX_ void (*hook)(pTHX)) {
-	dMY_CXT;
-
-	MY_CXT.hook = hook;
-
-	/* these get triggered on LEAVE inside ENTERSUB */
-	trace("saving stack pos %p (%d)\n", PL_stack_sp, PL_stack_sp - PL_stack_base);
-	SAVEDESTRUCTOR_X(setup_trampoline_cb, NULL);
-	SAVESTACK_POS(); /* Enforce some insanity in scalar context. */
-}
-
-
-
 
 
 
@@ -306,7 +264,6 @@ static void push_delim (pTHX) {
 	/* FIXME does this unwind at the right time? i think reset { }; shift { }
 	 * might cause a stale delimiter to be visible to shift { } */
 }
-
 
 
 
@@ -1155,10 +1112,12 @@ static void destroy_cont (pTHX_ cont_t *cont) {
 /* this is the hook used to invoke continuations, it's fired using the
  * trampoline code above to avoid needing to mop up the extra XSUB context */
 
-static void invoke_hook (pTHX) {
+static TRAMPOLINE_HOOK(invoke_hook) {
 	dSP;
 	I32 i;
 	dMY_CXT;
+
+	restore_saved_op(aTHX);
 
 	trace("invoking\n");
 
@@ -1189,6 +1148,8 @@ static void invoke_hook (pTHX) {
 
 	Safefree(MY_CXT.args);
 	MY_CXT.items = 0;
+
+	return NORMAL;
 }
 
 
@@ -1221,11 +1182,12 @@ XS(XS_Continuation__Delimited_cont_invoke)
 
 	PUTBACK;
 
-	MY_CXT.block = NULL;
 	MY_CXT.cont = (cont_t *)XSANY.any_ptr;
 	MY_CXT.retop = PL_op->op_next;
 
-	setup_trampoline(aTHX_ invoke_hook);
+	save_op(aTHX);
+
+	TRAMPOLINE(invoke_hook);
 }
 
 
@@ -1251,7 +1213,7 @@ static CV *cont_to_cv (pTHX_ cont_t *cont) {
 
 /* debugging aid to print the state of various stack items, invoked using the
  * trampoline hooks */
-static void stackdump (pTHX) {
+static TRAMPOLINE_HOOK(stackdump) {
 	delim_t delim;
 	//trace("====orz\n");
 	init_delim(aTHX_ &delim);
@@ -1260,6 +1222,8 @@ static void stackdump (pTHX) {
 	sv_dump(PL_comppad);
 	//sv_dump((SV *)PL_comppad);
 	//debstack();
+
+	return NORMAL;
 }
 
 
@@ -1269,20 +1233,36 @@ static void stackdump (pTHX) {
  * invoked from the trampoline hook so that the XSUB scope structures do not
  * have to be unwound (effectively called as an opcode in the scope that called
  * cont_shift */
-static void cont_shift_hook (pTHX) {
+static TRAMPOLINE_HOOK(cont_shift_hook) {
 	dSP;
+
+	restore_saved_op(aTHX);
 
 	cont_t *cont = create_cont(aTHX);
 	CV *cont_cv = cont_to_cv(aTHX_ cont);
 
-	/* create_cont modifies the stacks */
-	SPAGAIN;
+	SPAGAIN; /* create_cont modifies the stacks */
+
 	PUSHMARK(SP);
+
+	/* push the reified continuation */
 	XPUSHs(sv_2mortal(newRV_inc((SV *)cont_cv)));
 	PUTBACK;
-	push_block(aTHX);
+
+	/* invoke the block with the continuation as the arg */
+	push_saved_block(aTHX);
+
+	return PL_ppaddr[OP_ENTERSUB](aTHX);
 }
 
+static TRAMPOLINE_HOOK(cont_reset_hook) {
+	restore_saved_op(aTHX);
+
+	push_delim(aTHX);
+
+	/* after pushing the delimiter just invoke the saved block normally */
+	return invoke_saved_block_no_args(aTHX);
+}
 
 
 MODULE = Continuation::Delimited		PACKAGE = Continuation::Delimited
@@ -1293,6 +1273,8 @@ BOOT:
 	MY_CXT_INIT;
 
 	MY_CXT.last_mark = NULL;
+	MY_CXT.saved_op = NULL;
+	MY_CXT.saved_block = NULL;
 }
 
 
@@ -1309,9 +1291,8 @@ cont_shift (CV *block)
 		 * we could also rewrite the reset { } and shift { } calls when statically
 		 * bound to have a different op_ppaddr but this seems more reliable */
 
-		MY_CXT.block = block;
-		SvREFCNT_inc(block);
-
+		save_block(aTHX_ block);
+		save_op(aTHX);
 		TRAMPOLINE(cont_shift_hook);
 
 void
@@ -1320,10 +1301,9 @@ cont_reset (CV *block)
 	PREINIT:
 		dMY_CXT;
 	PPCODE:
-		MY_CXT.block = block;
-		SvREFCNT_inc(block);
-
-		TRAMPOLINE(push_delim);
+		save_block(aTHX_ block);
+		save_op(aTHX);
+		TRAMPOLINE(cont_reset_hook);
 
 void stk ()
 	PPCODE:
