@@ -4,7 +4,7 @@
 
 #include "ppport.h"
 
-#define DEBUG
+//#define DEBUG
 
 #ifdef DEBUG
 #define trace( format, args... ) fprintf( stderr, format, ##args )
@@ -35,11 +35,6 @@ typedef struct delim {
 	struct delim *prev;
 } delim_t;
 
-/* For Perl space exposure, flatten to single mixed stack of objects, [
- * SV(...), MARK, SCOPE(...), etc, merging the order of the items correctly.
- *
- * reconstructing a cont_t from this is a simple matter of walking that stack
- * and putting elements on the right stack */
 
 typedef struct cont {
 	AV *stack;
@@ -71,6 +66,20 @@ typedef struct cont {
 	delim_t *end;
 } cont_t;
 
+
+/* FIXME
+ *
+ * For Perl space exposure, flatten to single mixed stack of objects, [
+ * SV(...), MARK, SCOPE(...), etc, merging the order of the items correctly.
+ *
+ * reconstructing a cont_t from this is a simple matter of walking that stack
+ * and putting elements on the right stack */
+
+
+
+/* misc structures, used for trampolining etc. should mostly go away once code
+ * stabilizes a bit */
+
 typedef struct {
 	delim_t *last_mark;
 
@@ -89,6 +98,9 @@ typedef struct {
 } my_cxt_t;
 
 START_MY_CXT
+
+
+
 
 static void print_delim (delim_t *marker) {
 	printf("prev:  %p\n"
@@ -123,6 +135,9 @@ static void print_cont (cont_t *cont) {
 
 }
 
+
+
+/* pushes the stashed CV from MY_CXT for the entersub trampoline */
 static void push_block (pTHX) {
 	dSP;
 	dMY_CXT;
@@ -164,13 +179,20 @@ static OP *entersub_wrapper (pTHX) {
 
 	/* FIXME refactor */
 	if ( entersub ) {
+		trace("trampolining to entersub\n");
 		return PL_ppaddr[OP_ENTERSUB](aTHX);
 	} else {
 		return NORMAL;
 	}
 }
 
+
+/* FIXME this should move into say B::Hooks::XSUB::CallAsOp or somesuch */
+
 /* setup PL_op to trampoline into a block without an XSUB context */
+
+#define TRAMPOLINE(hook) PUTBACK, setup_trampoline(aTHX_ hook), XSRETURN(0)
+
 static void setup_trampoline_cb (pTHX_ void *ptr) {
 	dMY_CXT;
 	int flags = GIMME_V;
@@ -207,45 +229,54 @@ static void setup_trampoline (pTHX_ void (*hook)(pTHX)) {
 	SAVESTACK_POS(); /* Enforce some insanity in scalar context. */
 }
 
+
+
+
+
+
 /* captures values from the interpreter state */
-static void init_delim (pTHX_ delim_t *marker) {
+static void init_delim (pTHX_ delim_t *delim) {
 	dMY_CXT;
 
-	marker->prev = MY_CXT.last_mark;
+	delim->prev = MY_CXT.last_mark;
 
 	/* pointers have to be converted to relative indices */
-	marker->stack  = PL_stack_sp      - PL_stack_base;
-	marker->marks  = PL_markstack_ptr - PL_markstack;
+	delim->stack  = PL_stack_sp      - PL_stack_base;
+	delim->marks  = PL_markstack_ptr - PL_markstack;
 
 	/* these relative indices are not reused when resetting the state on
 	 * restoration, so they aren't in state.h */
-	marker->tmps   = PL_tmps_ix;
-	marker->cxs    = cxstack_ix;
-	marker->scopes = PL_scopestack_ix;
-	marker->saves  = PL_savestack_ix;
+	delim->tmps   = PL_tmps_ix;
+	delim->cxs    = cxstack_ix;
+	delim->scopes = PL_scopestack_ix;
+	delim->saves  = PL_savestack_ix;
 
-#define VAR(name, type) marker->name = PL_ ## name;
+#define VAR(name, type) delim->name = PL_ ## name;
 #include "state.h"
 #undef VAR
 
-	marker->curpad  = PL_curpad;
-	marker->comppad = PL_comppad;
+	delim->curpad  = PL_curpad;
+	delim->comppad = PL_comppad;
 
 	trace("init delim, SP=%p\n", PL_stack_sp);
 }
 
 static delim_t* create_delim (pTHX) {
-	delim_t *marker;
+	delim_t *delim;
 
-	Newx(marker, 1, delim_t);
-	init_delim(aTHX_ marker);
+	Newx(delim, 1, delim_t);
+	init_delim(aTHX_ delim);
 
-	return marker;
+	return delim;
 }
 
-static void destroy_delim (pTHX_ delim_t *marker) {
-	Safefree(marker);
+static void destroy_delim (pTHX_ delim_t *delim) {
+	Safefree(delim);
 }
+
+
+
+/* these functions manage delimiters in the dynamic scopes */
 
 static void pop_delim (pTHX) {
 	dMY_CXT;
@@ -276,7 +307,12 @@ static void push_delim (pTHX) {
 	 * might cause a stale delimiter to be visible to shift { } */
 }
 
-/* move the values and marks off the main stack, increasing the reference count */
+
+
+
+
+/* moves the values and marks off the main stack, increasing the reference
+ * count of the SVs */
 static void init_cont_stack (pTHX_ cont_t *cont) {
 	delim_t *start = cont->start;
 	delim_t *end   = cont->end;
@@ -315,6 +351,10 @@ static void init_cont_stack (pTHX_ cont_t *cont) {
 	PL_markstack_ptr = start->marks + PL_markstack;
 }
 
+/* moves the PERL_CONTEXTs from the cxstack into the cont
+ *
+ * offsets are converted to be relative to the start delimiter, instead of the
+ * the begining of runtime */
 static void init_cont_cxs (pTHX_ cont_t *cont) {
 	delim_t *start = cont->start;
 	delim_t *end   = cont->end;
@@ -398,6 +438,14 @@ static void init_cont_cxs (pTHX_ cont_t *cont) {
 	cont->cxs = cxs;
 }
 
+
+/* moves a single frame (the enum and all associated data) from the save stack
+ * to the appropriate target
+ *
+ * certain values go to the repeat stack (for instance lexical pad
+ * manipulation), to be recreated every time the continuation is invoked, and
+ * certain values are deferred to be recreated once and unwound when the
+ * reified continuation is destroyed */
 static void copy_save_frame (pTHX_ delim_t *start, ANY **saves_ptr_ptr, ANY **repeat_ptr_ptr, ANY **defer_ptr_ptr) {
 	I32 i;
 	ANY *saves_ptr = *saves_ptr_ptr;
@@ -518,6 +566,9 @@ static void copy_save_frame (pTHX_ delim_t *start, ANY **saves_ptr_ptr, ANY **re
 	*defer_ptr_ptr = defer_ptr;
 }
 
+/* partition the savestack into the defer_saves and repeat_saves buffers
+ *
+ * also handles the scopestack, which delimits the savestack */
 static void init_cont_saves (pTHX_ cont_t *cont) {
 	delim_t *start = cont->start;
 	delim_t *end   = cont->end;
@@ -677,6 +728,8 @@ static void init_cont_saves (pTHX_ cont_t *cont) {
 	 */
 }
 
+/* save various state variables, including the delimiter pointers, and reset
+ * the interpreter state vars to what they were in the start delimiter */
 static void init_cont_state (pTHX_ cont_t *cont) {
 	/* reset interpreter state */
 #define VAR(name, type) PL_ ## name = cont->start->name;
@@ -694,6 +747,7 @@ static void init_cont_state (pTHX_ cont_t *cont) {
 	cont->start->prev = NULL;
 }
 
+
 /* move everything (destructively) from the last delimiter into a reified
  * continuation structure, reverting the state into what it was at the time
  * that delimiter was taken
@@ -710,29 +764,25 @@ static void init_cont (pTHX_ cont_t *cont) {
 	cont->start = MY_CXT.last_mark;
 	cont->end = create_delim(aTHX);
 
-	/* FIXME first verify we aren't in substitution context or any XSUB between
-	 * the reset and the shift */
+	/* FIXME first verify we aren't in substitution context or any XSUB,
+	 * overloading, tie, or whatever between the reset and the shift
+	 *
+	 * we need to steal from Coro for this */
 
-	/* trace("from\n"); */
-	/* print_delim(start); */
-	/* trace("to\n"); */
-	/* print_delim(&end); */
-
-	init_cont_stack(aTHX_ cont);
-	init_cont_cxs(aTHX_ cont);
-	init_cont_saves(aTHX_ cont);
-	init_cont_state(aTHX_ cont);
-
-	/* init_delim(aTHX_ &end); */
-	/* trace("after\n"); */
-	/* print_delim(&end); */
+	init_cont_stack(aTHX_ cont); /* stacked SVs */
+	init_cont_cxs(aTHX_ cont); /* PERL_CONTEXT frames */
+	init_cont_saves(aTHX_ cont); /* partitions the savestack into defer and repeat, and also does scope */
+	init_cont_state(aTHX_ cont); /* state variables rolled back to cont->start values */
 }
 
-void save_delim (pTHX_ void *ptr) {
-	dMY_CXT;
 
-	MY_CXT.last_mark = (delim_t *)ptr;
-}
+
+
+
+
+
+
+
 
 /* copy values from the saved continuation into the live interpreter
  *
@@ -745,7 +795,7 @@ static void restore_cont (pTHX_ cont_t *cont, OP *retop) {
 
 	trace("restoring\n");
 
-	push_delim(aTHX);
+	push_delim(aTHX); /* create something akin to the start delim_t, but in the new context */
 
 	trace("top save: %d\n", PL_savestack[PL_savestack_ix - 1].any_i32);
 	trace("top scope: %d, save ix=%d\n", PL_scopestack[PL_scopestack_ix - 1], PL_savestack_ix);
@@ -1048,6 +1098,8 @@ static void restore_cont (pTHX_ cont_t *cont, OP *retop) {
 	ptr_table_free(cloned);
 }
 
+
+/* allocates a continuation and captures it destructively */
 static cont_t *create_cont (pTHX) {
 	cont_t *cont;
 
@@ -1075,6 +1127,16 @@ static void destroy_cont (pTHX_ cont_t *cont) {
 	LEAVE;
 
 }
+
+
+
+
+
+
+
+
+/* this is the hook used to invoke continuations, it's fired using the
+ * trampoline code above to avoid needing to mop up the extra XSUB context */
 
 static void invoke_hook (pTHX) {
 	dSP;
@@ -1112,6 +1174,15 @@ static void invoke_hook (pTHX) {
 	MY_CXT.items = 0;
 }
 
+
+
+/* this is a manually declared XSUB because we call newXS to generate anonymous
+ * CVs based on it, it's not a static function anywhere
+ *
+ * note that it is only glorified argument handling and trampoline setup, the
+ * actual invocation is done outisde of the XSUB context inside invoke_hook
+ * (called like an opcode) */
+
 XS(XS_Continuation__Delimited_cont_invoke); /* prototype to pass -Wmissing-prototypes */
 XS(XS_Continuation__Delimited_cont_invoke)
 {
@@ -1140,10 +1211,16 @@ XS(XS_Continuation__Delimited_cont_invoke)
 	setup_trampoline(aTHX_ invoke_hook);
 }
 
+
+
+/* reify a cont_t into a CV */
+
 static CV *cont_to_cv (pTHX_ cont_t *cont) {
+	/* create an anonymous CV from the cont_invoke hook */
 	CV *cv = newXS(NULL, XS_Continuation__Delimited_cont_invoke, "Delimited.xs");
 	sv_2mortal((SV *)cv);
 
+	/* put the cont_t in the CV's extra pointer */
 	XSANY.any_ptr = (ANY *)cont;
 
 	/* FIXME add free magic to call destroy_cont */
@@ -1151,6 +1228,12 @@ static CV *cont_to_cv (pTHX_ cont_t *cont) {
 	return cv;
 }
 
+
+
+
+
+/* debugging aid to print the state of various stack items, invoked using the
+ * trampoline hooks */
 static void stackdump (pTHX) {
 	delim_t delim;
 	//trace("====orz\n");
@@ -1162,6 +1245,13 @@ static void stackdump (pTHX) {
 	//debstack();
 }
 
+
+
+/* captures a continuation
+ *
+ * invoked from the trampoline hook so that the XSUB scope structures do not
+ * have to be unwound (effectively called as an opcode in the scope that called
+ * cont_shift */
 static void cont_shift_hook (pTHX) {
 	dSP;
 
@@ -1176,7 +1266,7 @@ static void cont_shift_hook (pTHX) {
 	push_block(aTHX);
 }
 
-#define TRAMPOLINE(hook) PUTBACK, setup_trampoline(aTHX_ hook), XSRETURN(0)
+
 
 MODULE = Continuation::Delimited		PACKAGE = Continuation::Delimited
 
@@ -1187,6 +1277,7 @@ BOOT:
 
 	MY_CXT.last_mark = NULL;
 }
+
 
 void
 cont_shift (CV *block)
