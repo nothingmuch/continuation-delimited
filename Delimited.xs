@@ -16,6 +16,10 @@
 #define debug(...)
 #endif
 
+#ifndef GROW
+#define GROW(old) ((old) * 3 / 2)
+#endif
+
 #define MY_CXT_KEY "Continuation::Delimited::_guts" XS_VERSION
 
 typedef struct delim {
