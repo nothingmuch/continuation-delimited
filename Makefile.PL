@@ -18,6 +18,8 @@ test_requires 'Test::More' => '0.88';
 
 repository 'git://github.com/nothingmuch/continuation-delimited.git';
 
+ppport;
+
 my $pkg = ExtUtils::Depends->new('Continuation::Delimited', 'B::Hooks::XSUB::CallAsOp');
 
 WriteMakefile(
