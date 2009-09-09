@@ -781,37 +781,8 @@ static void init_cont (pTHX_ cont_t *cont) {
 
 
 
-
-
-
-/* copy values from the saved continuation into the live interpreter
- *
- * this operation should be invokable multiple times */
-static void restore_cont (pTHX_ cont_t *cont, OP *retop) {
-	I32 i, end;
-	PTR_TBL_t *cloned = ptr_table_new();
-	I32 pads;
-	dMY_CXT;
-
-	trace("restoring\n");
-
-	push_delim(aTHX); /* create something akin to the start delim_t, but in the new context */
-
-	trace("top save: %d\n", PL_savestack[PL_savestack_ix - 1].any_i32);
-	trace("top scope: %d, save ix=%d\n", PL_scopestack[PL_scopestack_ix - 1], PL_savestack_ix);
-
-	trace("current PL_comppad=%p, start comppad=%p, end comppad=%p\n", PL_comppad, cont->start->comppad, cont->end->comppad);
-
-	/* restore all the interpreter variables to the state at the end of the  */
-#define VAR(name, type) PL_ ## name = cont->end->name;
-#include "state.h"
-#undef VAR
-
-	/* clone the pads, fixup the contexts */
-
-	trace("top save: %d\n", PL_savestack[PL_savestack_ix - 1].any_i32);
-	trace("top scope: %d, save ix=%d\n", PL_scopestack[PL_scopestack_ix - 1], PL_savestack_ix);
-
+static void restore_cont_cxs (pTHX_ cont_t *cont, OP *retop, PTR_TBL_t *cloned) {
+	I32 i, end, pads;
 
 	end = cxstack_ix + cont->cxs_len;
 
@@ -1007,6 +978,14 @@ static void restore_cont (pTHX_ cont_t *cont, OP *retop) {
 		trace("i=%d, savestack-ix=%d, scope=%d\n", i, PL_savestack_ix, cont->scopes[i]);
 		PL_scopestack[PL_scopestack_ix++] = PL_savestack_ix + cont->scopes[i];
 	}
+}
+
+
+/* recreate all the savestack frames that should be recreated on each
+ * invocation, namely pad management (and in the future, localizations) */
+
+static void restore_cont_saves (pTHX_ cont_t *cont, PTR_TBL_t *cloned) {
+	I32 i;
 
 	if ( cont->repeat_len ) {
 		/* FIXME fixup SAVECOMPPAD entries, fix 0 based offsets */
@@ -1064,13 +1043,33 @@ static void restore_cont (pTHX_ cont_t *cont, OP *retop) {
 	trace("scopescack_ix=%d\n", PL_scopestack_ix);
 	trace("top save: %d\n", PL_savestack[PL_savestack_ix - 1].any_i32);
 	trace("top scope: %d, save ix=%d\n", PL_scopestack[PL_scopestack_ix - 1], PL_savestack_ix);
+}
 
+
+/* this is like the other havlf of restore_cont_state, it must be run *after*
+ * we've cloned everything in the pads */
+static void restore_cont_state (pTHX_ cont_t *cont, PTR_TBL_t *cloned) {
+	SV *comppad = ptr_table_fetch(cloned, cont->end->comppad); 
+
+	/* restore all the interpreter variables to the state at the end of the  */
+#define VAR(name, type) PL_ ## name = cont->end->name;
+#include "state.h"
+#undef VAR
 
 	/* fixup PL_comppad to point to the cloned pad corresponding to the top of the stack */
-	trace("overwriting PL_comppad=%p from end comppad=%p to %p\n", PL_comppad, cont->end->comppad, ptr_table_fetch(cloned, cont->end->comppad));
-	PL_comppad = ptr_table_fetch(cloned, cont->end->comppad);
+	trace("overwriting PL_comppad=%p from end comppad=%p to %p\n", PL_comppad, cont->end->comppad, comppad);
+
 	assert(PL_comppad);
+	assert(SvTYPE(PL_comppad) == SVt_PVAV);
+
+	PL_comppad = comppad;
 	PL_curpad = AvARRAY(PL_comppad);
+}
+
+/* restore SV values. arguments that have been cloned (appear in the pointer
+ * table) are translated into the clones */
+void restore_cont_stack (pTHX_ cont_t *cont, PTR_TBL_t *cloned) {
+	I32 i;
 
 	for ( i = 0; i < cont->marks_len; i++ ) {
 		PUSHMARK( PL_stack_sp + cont->marks[i] );
@@ -1094,6 +1093,24 @@ static void restore_cont (pTHX_ cont_t *cont, OP *retop) {
 
 		PUTBACK;
 	}
+}
+
+
+/* copy values from the saved continuation into the live interpreter
+ *
+ * this operation should be invokable multiple times */
+static void restore_cont (pTHX_ cont_t *cont, OP *retop) {
+	PTR_TBL_t *cloned = ptr_table_new(); /* tracks pointers from proto pads to cloned values */
+	dMY_CXT;
+
+	trace("restoring\n");
+
+	push_delim(aTHX); /* create something akin to the start delim_t, but in the new context */
+
+	restore_cont_cxs(aTHX_ cont, retop, cloned); /* clones pad storage and recreates the context stack */
+	restore_cont_saves(aTHX_ cont, cloned); /* recreates the save frames from the repeat list */
+	restore_cont_state(aTHX_ cont, cloned); /* resets state variables, including comppad from the loned list */
+	restore_cont_stack(aTHX_ cont, cloned); /* recreates argument values */
 
 	ptr_table_free(cloned);
 }
