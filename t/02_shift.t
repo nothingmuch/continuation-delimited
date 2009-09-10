@@ -122,6 +122,8 @@ my $z = $add_zot->(7);
 is( $z, 20, "Add with a nested sub" );
 is( $add_zot->(5), 18, "Add with a nested sub" );
 is( $add_zot->(20), 33, "Add with a nested sub" );
+is( $add_zot->(42), 55, "Add with a nested sub" );
+is( $add_zot->(1), 14, "Add with a nested sub" );
 
 {
 	my ( @log, $end );
