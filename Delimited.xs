@@ -20,6 +20,16 @@
 #define GROW(old) ((old) * 3 / 2)
 #endif
 
+
+#define PERL_VERSION_ATLEAST(a,b,c)				\
+  (PERL_REVISION > (a)						\
+   || (PERL_REVISION == (a)					\
+       && (PERL_VERSION > (b)					\
+           || (PERL_VERSION == (b) && PERL_SUBVERSION >= (c)))))
+
+
+
+
 #define MY_CXT_KEY "Continuation::Delimited::_guts" XS_VERSION
 
 typedef struct delim {
@@ -139,7 +149,7 @@ static void print_cont (cont_t *cont) {
 
 /* stashes PL_op before the trampoline hack. this allows cont_reset,
  * cont_invoke and cont_shift to have a proper value for PL_op */
-static void save_op (pTHX) {
+static void trampoline_save_op (pTHX) {
 	assert(MY_CXT.saved_op == NULL);
 	MY_CXT.saved_op = PL_op;
 }
@@ -147,7 +157,7 @@ static void save_op (pTHX) {
 /* stashes a block for future invocation. Since the trampoline can't pass
  * values using the stack, we have to save it temporarily. This is used by
  * cont_reset { } and cont_shift { }'s calling convention */
-static void save_block (pTHX_ CV *block) {
+static void trampoline_save_block (pTHX_ CV *block) {
 	assert(MY_CXT.saved_block == NULL);
 
 	MY_CXT.saved_block = block;
@@ -347,15 +357,42 @@ static void init_cont_cxs (pTHX_ cont_t *cont) {
 			cx->blk_oldmarksp  -= cont->start->marks;
 			cx->blk_oldscopesp -= cont->start->scopes;
 
+			assert(cx->blk_oldsp >= 0);
+			assert(cx->blk_oldmarksp >= 0);
+			assert(cx->blk_oldscopesp >= 0);
+
 			switch (CxTYPE(cx)) {
 				CV *cv;
+				AV *padlist;
 				SV *pad;
 
 				trace("saw oldcomppad %p\n", cx->blk_sub.oldcomppad);
 
 				case CXt_SUB:
 					cv = cx->blk_sub.cv;
-					pad = av_pop(CvPADLIST(cv));
+					padlist = CvPADLIST(cv);
+
+					assert(AvFILLp(padlist) >= 1); /* don't pop the names */
+					assert(CvDEPTH(cv) >= 1); /* don't pop the names */
+					assert(CvDEPTH(cv) == 1 + cx->blk_sub.olddepth);
+					assert(CvDEPTH(cv) == AvFILLp(padlist));
+
+					pad = AvARRAY(padlist)[AvFILLp(padlist)];
+					AvFILLp(padlist)--;
+
+					/* we must always have at least one allocated pad storage array */
+					if ( AvFILLp(padlist) == 0 ) {
+#if PERL_VERSION_ATLEAST (5,10,0)
+						Perl_pad_push(aTHX_ padlist, AvFILLp(padlist) + 1);
+#else
+						Perl_pad_push(aTHX_ padlist, AvFILLp(padlist) + 1, 1);
+#endif
+					}
+
+					assert((CvDEPTH(cv) == 1 + AvFILLp(padlist)) || (cx->blk_sub.olddepth == 0 && AvFILLp(padlist) == 1));
+
+					assert(pad);
+					assert(SvTYPE(pad) == SVt_PVAV);
 
 					trace("saw pad %p at depth %d of cv %p\n", pad, CvDEPTH(cv), cv);
 
@@ -376,7 +413,15 @@ static void init_cont_cxs (pTHX_ cont_t *cont) {
 							CLEAR_ARGARRAY(cx->blk_sub.argarray);
 						}
 					}
+
+					assert( CvDEPTH(cv) == 1 + cx->blk_sub.olddepth );
+
 					CvDEPTH(cv) = cx->blk_sub.olddepth;
+
+					/* make sure we didn't stomp the names */
+					assert((CvDEPTH(cv) == AvFILLp(padlist)) || (CvDEPTH(cv) == 0 && AvFILLp(padlist) == 1));
+					assert(AvARRAY(CvPADLIST(cv))[0]);
+					assert(SvTYPE(AvARRAY(CvPADLIST(cv))[0]) == SVt_PVAV);
 
 					break;
 
@@ -597,7 +642,7 @@ static void init_cont_saves (pTHX_ cont_t *cont) {
 			trace("scopes ptr=%p, index=%d, scope_base=%p, savestack=%p\n", scopes_ptr, *scopes_ptr, &PL_savestack[*scopes_ptr], PL_savestack);
 			trace("repeat_ptr=%p, defer_ptr=%p, saves_ptr=%p\n", repeat_ptr, defer_ptr, saves_ptr);
 
-			trace("save entry: %d\n",saves_ptr->any_i32); 
+			trace("save entry: %d\n",saves_ptr->any_i32);
 
 			copy_save_frame(aTHX_ start, &saves_ptr, &repeat_ptr, &defer_ptr);
 		}
@@ -605,7 +650,7 @@ static void init_cont_saves (pTHX_ cont_t *cont) {
 		assert(saves_ptr == &PL_savestack[*scopes_ptr - 1]);
 
 		/* now create a new scopes entry for the repeat stack only (at
-		 * destruction we unwind everything in the defers as a single scope) 
+		 * destruction we unwind everything in the defers as a single scope)
 		 *
 		 * the save entry is actually bogus, we need to convert it into a zero
 		 * based offsets based on the differences at the end, but we don't yet
@@ -782,8 +827,9 @@ static void restore_cont_cxs (pTHX_ cont_t *cont, OP *retop, PTR_TBL_t *cloned) 
 					CV *cv  = cx->blk_sub.cv;
 					AV **pad_av_elem = (AV **)av_fetch(cont->pads, pads--, 0);
 					assert(pad_av_elem);
+					AV *padlist = CvPADLIST(cv);
 					AV *pad_av = *pad_av_elem;
-					AV *names_av = (AV *)AvARRAY(CvPADLIST(cv))[0];
+					AV *names_av = (AV *)AvARRAY(padlist)[0];
 					SV **pad   = AvARRAY(pad_av);
 					SV **names = AvARRAY(names_av);
 					I32 pad_fill   = AvFILLp(pad_av);
@@ -795,6 +841,7 @@ static void restore_cont_cxs (pTHX_ cont_t *cont, OP *retop, PTR_TBL_t *cloned) 
 					debug(assert( (SV *)cv == *av_fetch(cont->cvs, pads+1, 0) ));
 
 
+					assert(names_fill <= pad_fill);
 					trace("names fill: %d, pad_fill: %d\n", names_fill, pad_fill);
 
 					/* create a new comppad AV, with the same SVs as the previous one */
@@ -870,10 +917,17 @@ static void restore_cont_cxs (pTHX_ cont_t *cont, OP *retop, PTR_TBL_t *cloned) 
 
 					/* FIXME need to work out sp/mark from oldsp and friends to count args and copy */
 
+					assert(CvDEPTH(cv) >= 0);
+
 					cx->blk_sub.olddepth = CvDEPTH(cv);
 
+					trace("padfill: %d, depth: %d\n", AvFILLp(padlist), CvDEPTH(cv));
+					assert((CvDEPTH(cv) == AvFILLp(padlist)) || (CvDEPTH(cv) == 0 && AvFILLp(padlist) == 1));
+
 					CvDEPTH(cv)++;
-					av_push(CvPADLIST(cv), (SV *)copy);
+					av_store(padlist, CvDEPTH(cv), copy);
+
+					assert(AvFILLp(padlist) == CvDEPTH(cv));
 
 					trace("pad %p -> %p\n", pad_av, copy);
 					ptr_table_store(cloned, pad_av, copy);
@@ -927,7 +981,6 @@ static void restore_cont_cxs (pTHX_ cont_t *cont, OP *retop, PTR_TBL_t *cloned) 
 
 	trace("top save: %d\n", PL_savestack[PL_savestack_ix - 1].any_i32);
 	trace("top scope: %d, save ix=%d\n", PL_scopestack[PL_scopestack_ix - 1], PL_savestack_ix);
-
 
 	/* FIXME, this is horrible, but there's nothing in the Perl api for it */
 	if ( PL_scopestack_ix + cont->scopes_len > PL_scopestack_max ) {
@@ -1010,12 +1063,15 @@ static void restore_cont_saves (pTHX_ cont_t *cont, PTR_TBL_t *cloned) {
 /* this is like the other havlf of restore_cont_state, it must be run *after*
  * we've cloned everything in the pads */
 static void restore_cont_state (pTHX_ cont_t *cont, PTR_TBL_t *cloned) {
-	SV *comppad = ptr_table_fetch(cloned, cont->end->comppad); 
+	SV *comppad;
 
 	/* restore all the interpreter variables to the state at the end of the  */
 #define VAR(name, type) PL_ ## name = cont->end->name;
 #include "state.h"
 #undef VAR
+
+	assert(PL_op);
+	assert(PL_op->op_next);
 
 	/* fixup PL_comppad to point to the cloned pad corresponding to the top of the stack */
 	trace("overwriting PL_comppad=%p from end comppad=%p to %p\n", PL_comppad, cont->end->comppad, comppad);
@@ -1023,7 +1079,12 @@ static void restore_cont_state (pTHX_ cont_t *cont, PTR_TBL_t *cloned) {
 	assert(PL_comppad);
 	assert(SvTYPE(PL_comppad) == SVt_PVAV);
 
+	comppad = ptr_table_fetch(cloned, cont->end->comppad);
 	PL_comppad = comppad;
+
+	assert(PL_comppad);
+	assert(SvTYPE(PL_comppad) == SVt_PVAV);
+
 	PL_curpad = AvARRAY(PL_comppad);
 }
 
@@ -1189,7 +1250,7 @@ XS(XS_Continuation__Delimited_cont_invoke)
 	MY_CXT.cont = (cont_t *)XSANY.any_ptr;
 	MY_CXT.retop = PL_op->op_next;
 
-	save_op(aTHX);
+	trampoline_save_op(aTHX);
 
 	TRAMPOLINE(invoke_hook);
 }
@@ -1295,8 +1356,8 @@ cont_shift (CV *block)
 		 * we could also rewrite the reset { } and shift { } calls when statically
 		 * bound to have a different op_ppaddr but this seems more reliable */
 
-		save_block(aTHX_ block);
-		save_op(aTHX);
+		trampoline_save_block(aTHX_ block);
+		trampoline_save_op(aTHX);
 		TRAMPOLINE(cont_shift_hook);
 
 void
@@ -1305,8 +1366,8 @@ cont_reset (CV *block)
 	PREINIT:
 		dMY_CXT;
 	PPCODE:
-		save_block(aTHX_ block);
-		save_op(aTHX);
+		trampoline_save_block(aTHX_ block);
+		trampoline_save_op(aTHX);
 		TRAMPOLINE(cont_reset_hook);
 
 void stk ()
