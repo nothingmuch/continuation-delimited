@@ -99,14 +99,10 @@ typedef struct cont {
 typedef struct {
 	delim_t *last_mark;
 
-	CV *saved_block;
-	OP *saved_op;
-
-	/* used in invoke */
-	SV **args;
-	I32 items;
-	cont_t *cont;
-	OP *retop;
+	/* used by invoke, like trampoline_save_* */
+	CV     *saved_block;
+	cont_t *saved_cont;
+	OP     *saved_retop;
 } my_cxt_t;
 
 START_MY_CXT
@@ -147,32 +143,22 @@ static void print_cont (cont_t *cont) {
 
 }
 
-/* stashes PL_op before the trampoline hack. this allows cont_reset,
- * cont_invoke and cont_shift to have a proper value for PL_op */
-static void trampoline_save_op (pTHX) {
-	assert(MY_CXT.saved_op == NULL);
-	MY_CXT.saved_op = PL_op;
-}
 
 /* stashes a block for future invocation. Since the trampoline can't pass
  * values using the stack, we have to save it temporarily. This is used by
  * cont_reset { } and cont_shift { }'s calling convention */
 static void trampoline_save_block (pTHX_ CV *block) {
+	dMY_CXT;
+
 	assert(MY_CXT.saved_block == NULL);
+
+	assert(block);
+	assert(SvTYPE((SV *)block) == SVt_PVCV);
 
 	MY_CXT.saved_block = block;
 	SvREFCNT_inc(block);
 }
 
-
-/* restore PL_op's state to what it was before the trampoline */
-static void restore_saved_op (pTHX) {
-	assert(MY_CXT.saved_op != NULL);
-
-	PL_op = MY_CXT.saved_op;
-
-	MY_CXT.saved_op = NULL;
-}
 
 /* pushes the stashed CV from MY_CXT for the entersub trampoline */
 static void push_saved_block (pTHX) {
@@ -190,15 +176,25 @@ static void push_saved_block (pTHX) {
 /* this is like an entersub ppaddr but lets us invoke a hook first. it's used
  * to inject a call to the blocks given to reset { } and shift { } without the
  * XSUB context on the stack */
-static OP *invoke_saved_block_no_args (pTHX) {
+static OP *invoke_saved_block (pTHX_ SV *arg) {
 	dSP;
+	dMY_CXT;
 
 	PUSHMARK(SP);
+
+	if ( arg != NULL ) {
+		XPUSHs(arg);
+		PUTBACK;
+	}
+
 	push_saved_block(aTHX);
 
 	return PL_ppaddr[OP_ENTERSUB](aTHX);
 }
 
+static OP *invoke_saved_block_no_args (pTHX) {
+	return invoke_saved_block(aTHX_ NULL);
+}
 
 /* FIXME this should move into say B::Hooks::XSUB::CallAsOp or somesuch */
 
@@ -742,10 +738,20 @@ static void init_cont_state (pTHX_ cont_t *cont) {
 #include "state.h"
 #undef VAR
 
+	assert(PL_op);
+	assert(PL_op->op_next);
+
+	assert(PL_comppad);
+	assert(SvTYPE(PL_comppad) == SVt_PVAV);
+
 	dMY_CXT;
 
 	PL_comppad = cont->start->comppad;
 	PL_curpad  = cont->start->curpad;
+
+	assert(PL_comppad);
+	assert(SvTYPE(PL_comppad) == SVt_PVAV);
+	assert(PL_curpad == AvARRAY(PL_comppad));
 
 	/* SAVEDESTRUCTOR_X is captured inside the continuation, so we detach this
 	 * delimiter chain */
@@ -925,7 +931,7 @@ static void restore_cont_cxs (pTHX_ cont_t *cont, OP *retop, PTR_TBL_t *cloned) 
 					assert((CvDEPTH(cv) == AvFILLp(padlist)) || (CvDEPTH(cv) == 0 && AvFILLp(padlist) == 1));
 
 					CvDEPTH(cv)++;
-					av_store(padlist, CvDEPTH(cv), copy);
+					av_store(padlist, CvDEPTH(cv), (SV *)copy);
 
 					assert(AvFILLp(padlist) == CvDEPTH(cv));
 
@@ -1063,7 +1069,7 @@ static void restore_cont_saves (pTHX_ cont_t *cont, PTR_TBL_t *cloned) {
 /* this is like the other havlf of restore_cont_state, it must be run *after*
  * we've cloned everything in the pads */
 static void restore_cont_state (pTHX_ cont_t *cont, PTR_TBL_t *cloned) {
-	SV *comppad;
+	AV *comppad;
 
 	/* restore all the interpreter variables to the state at the end of the  */
 #define VAR(name, type) PL_ ## name = cont->end->name;
@@ -1079,7 +1085,7 @@ static void restore_cont_state (pTHX_ cont_t *cont, PTR_TBL_t *cloned) {
 	assert(PL_comppad);
 	assert(SvTYPE(PL_comppad) == SVt_PVAV);
 
-	comppad = ptr_table_fetch(cloned, cont->end->comppad);
+	comppad = (AV *)ptr_table_fetch(cloned, cont->end->comppad);
 	PL_comppad = comppad;
 
 	assert(PL_comppad);
@@ -1182,15 +1188,17 @@ static TRAMPOLINE_HOOK(invoke_hook) {
 	I32 i;
 	dMY_CXT;
 
-	restore_saved_op(aTHX);
+	TRAMPOLINE_RESTORE_OP;
 
 	trace("invoking\n");
 
 	trace("SP=%p, MARK=%d\n", SP, TOPMARK);
 
-	restore_cont(aTHX_ MY_CXT.cont, MY_CXT.retop);
-	MY_CXT.cont = NULL;
-	MY_CXT.retop = NULL;
+	assert(MY_CXT.saved_cont != NULL);
+	assert(MY_CXT.saved_retop != NULL);
+	restore_cont(aTHX_ MY_CXT.saved_cont, MY_CXT.saved_retop);
+	MY_CXT.saved_cont = NULL;
+	MY_CXT.saved_retop = NULL;
 
 	SPAGAIN;
 
@@ -1198,21 +1206,9 @@ static TRAMPOLINE_HOOK(invoke_hook) {
 
 	trace("appending extra args\n");
 
-	EXTEND(SP, MY_CXT.items);
-
-	for ( i = 0; i < MY_CXT.items; i++ ) {
-		SV *sv = MY_CXT.args[i];
-
-		SvREFCNT_inc(sv);
-		mPUSHs(MY_CXT.args[i]);
-	}
-
-	PUTBACK;
+	TRAMPOLINE_RESTORE_ARGS;
 
 	trace("SP=%p, MARK=%d\n", SP, TOPMARK);
-
-	Safefree(MY_CXT.args);
-	MY_CXT.items = 0;
 
 	return NORMAL;
 }
@@ -1229,28 +1225,30 @@ static TRAMPOLINE_HOOK(invoke_hook) {
 XS(XS_Continuation__Delimited_cont_invoke); /* prototype to pass -Wmissing-prototypes */
 XS(XS_Continuation__Delimited_cont_invoke)
 {
-	trace("stashing args, SP=%p\n", PL_stack_sp);
 #ifdef dVAR
-	dVAR; dXSARGS;
+    dVAR; dXSARGS;
 #else
-	dXSARGS;
+    dXSARGS;
 #endif
 	dMY_CXT;
+	cont_t *cont;
 
-	/* stash the arguments */
-	trace("stashing args, SP=%p, items=%d\n", SP, items);
-	SP -= items;
-	Newx(MY_CXT.args, items, SV *);
-	Copy(SP + 1, MY_CXT.args, items, SV *);
-	MY_CXT.items = items;
-	trace("stashed args, SP=%p, items=%d\n", SP, items);
+	/* stash the continuation stored in the CV */
+	assert(PL_op != NULL);
+	assert(PL_op->op_next != NULL);
 
-	PUTBACK;
+	assert(MY_CXT.saved_cont == NULL);
+	assert(MY_CXT.saved_retop == NULL);
 
-	MY_CXT.cont = (cont_t *)XSANY.any_ptr;
-	MY_CXT.retop = PL_op->op_next;
+	cont = (cont_t *)XSANY.any_ptr;
 
-	trampoline_save_op(aTHX);
+	assert(cont != NULL);
+	MY_CXT.saved_cont = cont;
+	MY_CXT.saved_retop = PL_op->op_next;
+
+	/* stash additional things */
+	TRAMPOLINE_SAVE_ARGS;
+	TRAMPOLINE_SAVE_OP;
 
 	TRAMPOLINE(invoke_hook);
 }
@@ -1284,7 +1282,7 @@ static TRAMPOLINE_HOOK(stackdump) {
 	init_delim(aTHX_ &delim);
 	print_delim(&delim);
 	trace("curpad=%p comppad=%p\n", PL_curpad, PL_comppad);
-	sv_dump(PL_comppad);
+	sv_dump((SV *)PL_comppad);
 	//sv_dump((SV *)PL_comppad);
 	//debstack();
 
@@ -1299,29 +1297,28 @@ static TRAMPOLINE_HOOK(stackdump) {
  * have to be unwound (effectively called as an opcode in the scope that called
  * cont_shift */
 static TRAMPOLINE_HOOK(cont_shift_hook) {
-	dSP;
+	cont_t *cont;
+	CV *cont_cv;
+	SV *coderef;
 
-	restore_saved_op(aTHX);
+	/* restore PL_op so that the delimiter contains the right value, the
+	 * current value is set by the trampoline hack */
+	TRAMPOLINE_RESTORE_OP;
 
-	cont_t *cont = create_cont(aTHX);
-	CV *cont_cv = cont_to_cv(aTHX_ cont);
+	cont = create_cont(aTHX);
+	cont_cv = cont_to_cv(aTHX_ cont);
+	coderef = newRV_inc((SV *)cont_cv);
 
-	SPAGAIN; /* create_cont modifies the stacks */
+	sv_2mortal(coderef);
 
-	PUSHMARK(SP);
-
-	/* push the reified continuation */
-	XPUSHs(sv_2mortal(newRV_inc((SV *)cont_cv)));
-	PUTBACK;
-
-	/* invoke the block with the continuation as the arg */
-	push_saved_block(aTHX);
-
-	return PL_ppaddr[OP_ENTERSUB](aTHX);
+	/* invoke the block with the reified continuation as the only arg */
+	invoke_saved_block(aTHX_ coderef);
 }
 
 static TRAMPOLINE_HOOK(cont_reset_hook) {
-	restore_saved_op(aTHX);
+	/* restore PL_op so that the delimiter contains the right value, the
+	 * current value is set by the trampoline hack */
+	TRAMPOLINE_RESTORE_OP;
 
 	push_delim(aTHX);
 
@@ -1337,9 +1334,8 @@ BOOT:
 {
 	MY_CXT_INIT;
 
-	MY_CXT.last_mark = NULL;
-	MY_CXT.saved_op = NULL;
 	MY_CXT.saved_block = NULL;
+	MY_CXT.last_mark   = NULL;
 }
 
 
@@ -1357,7 +1353,7 @@ cont_shift (CV *block)
 		 * bound to have a different op_ppaddr but this seems more reliable */
 
 		trampoline_save_block(aTHX_ block);
-		trampoline_save_op(aTHX);
+		TRAMPOLINE_SAVE_OP;
 		TRAMPOLINE(cont_shift_hook);
 
 void
@@ -1367,7 +1363,7 @@ cont_reset (CV *block)
 		dMY_CXT;
 	PPCODE:
 		trampoline_save_block(aTHX_ block);
-		trampoline_save_op(aTHX);
+		TRAMPOLINE_SAVE_OP;
 		TRAMPOLINE(cont_reset_hook);
 
 void stk ()
