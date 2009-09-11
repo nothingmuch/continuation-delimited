@@ -3,7 +3,7 @@
 use strict;
 use warnings;
 
-use Test::More tests => 56;
+use Test::More tests => 58;
 
 use ok 'Continuation::Delimited' => qw(cont_reset cont_shift);
 

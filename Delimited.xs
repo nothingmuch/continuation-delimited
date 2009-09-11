@@ -841,6 +841,8 @@ static void restore_cont_cxs (pTHX_ cont_t *cont, OP *retop, PTR_TBL_t *cloned) 
 					I32 pad_fill   = AvFILLp(pad_av);
 					I32 names_fill = AvFILLp(names_av);
 
+					SvREFCNT_inc(cv);
+
 					trace("BLK_SUB.OLDCOMPPAD = %p\n", cx->blk_sub.oldcomppad);
 					trace("pad[%d] = %p\n", pads-1, pad_av);
 					trace("cv=%p, cvs[pads]=%p\n", cv, AvARRAY(cont->cvs)[pads+1]);
