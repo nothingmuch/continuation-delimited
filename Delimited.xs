@@ -5,6 +5,8 @@
 #include "ppport.h"
 
 #include "hook_xsub_callasop.h"
+#include "magical_hooker_decorate.h"
+#include "xs_object_magic.h"
 
 //#define DEBUG
 
@@ -31,6 +33,8 @@
 
 
 #define MY_CXT_KEY "Continuation::Delimited::_guts" XS_VERSION
+
+static char private = 0;
 
 typedef struct delim {
 	I32 stack;
@@ -1256,6 +1260,10 @@ XS(XS_Continuation__Delimited_cont_invoke)
 }
 
 
+static SV *cont_to_obj (pTHX_ cont_t *cont) {
+	return xs_object_magic_create((void *)cont, gv_stashpv("Continuation::Delimited::State", 0));
+}
+
 
 /* reify a cont_t into a CV */
 
@@ -1267,7 +1275,7 @@ static CV *cont_to_cv (pTHX_ cont_t *cont) {
 	/* put the cont_t in the CV's extra pointer */
 	XSANY.any_ptr = (ANY *)cont;
 
-	/* FIXME add free magic to call destroy_cont */
+	magical_hooker_decoration_set(aTHX_ (SV *)cv, cont_to_obj(cont), (void *)&private);
 
 	return cv;
 }
@@ -1371,3 +1379,12 @@ cont_reset (CV *block)
 void stk ()
 	PPCODE:
 		TRAMPOLINE(stackdump);
+
+
+MODULE = Continuation::Delimited		PACKAGE = Continuation::Delimited::State
+
+void
+DESTROY (cont_t *cont)
+	CODE:
+		destroy_cont(aTHX_ cont);
+

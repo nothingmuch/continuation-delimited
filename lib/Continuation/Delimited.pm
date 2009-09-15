@@ -5,6 +5,8 @@ use strict;
 use warnings;
 
 use B::Hooks::XSUB::CallAsOp;
+use Magical::Hooker::Decorate;
+use XS::Object::Magic;
 
 use Sub::Exporter -setup => {
 	exports => [qw(
