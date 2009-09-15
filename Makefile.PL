@@ -26,6 +26,8 @@ foreach my $dep ( keys %c_deps ) {
 configure_requires 'ExtUtils::Depends' => 0.302;
 
 test_requires 'Test::More' => '0.88';
+test_requires 'Test::use::ok' => 0;
+test_requires 'Scope::Guard' => 0;
 
 repository 'git://github.com/nothingmuch/continuation-delimited.git';
 

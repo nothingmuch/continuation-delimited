@@ -717,7 +717,7 @@ static void init_cont_saves (pTHX_ cont_t *cont) {
 	trace("top scope: %d, save ix=%d\n", PL_scopestack[PL_scopestack_ix - 1], PL_savestack_ix);
 
 	Newx(tmps, cont->tmps_len, SV *);
-	Copy(&PL_tmps_stack, tmps, cont->tmps_len, SV **);
+	Copy(&PL_tmps_stack[PL_tmps_ix], tmps, cont->tmps_len, SV **);
 
 	cont->tmps  = tmps;
 
@@ -1170,13 +1170,29 @@ static void destroy_cont (pTHX_ cont_t *cont) {
 	/* make sure to redecrement the refcount for stacked values properly */
 
 	ENTER;
+	SAVETMPS;
 
 	SSGROW(PL_savestack_ix + cont->defer_len);
 	Copy(cont->defer_saves, &PL_savestack[PL_savestack_ix], cont->defer_len, ANY *);
 	PL_savestack_ix += cont->defer_len;
 
+	/* push the stashed tmps onto the tmps stack */
+	EXTEND_MORTAL(cont->tmps_len);
+	Copy(cont->tmps, &PL_tmps_stack[PL_tmps_ix + 1], cont->tmps_len, SV **);
+	PL_tmps_ix += cont->tmps_len;
+
+	FREETMPS;
 	LEAVE;
 
+
+	/* FIXME should these be destroyed in reverse by popping? */
+	sv_2mortal((SV *)cont->stack);
+	sv_2mortal((SV *)cont->pads);
+
+	debug(sv_2mortal((SV *)cont->cvs)); /* only present in debug mode */
+
+
+	Safefree(cont);
 }
 
 
@@ -1261,7 +1277,7 @@ XS(XS_Continuation__Delimited_cont_invoke)
 
 
 static SV *cont_to_obj (pTHX_ cont_t *cont) {
-	return xs_object_magic_create((void *)cont, gv_stashpv("Continuation::Delimited::State", 0));
+	return sv_2mortal(xs_object_magic_create((void *)cont, gv_stashpv("Continuation::Delimited::State", 0)));
 }
 
 
@@ -1336,6 +1352,18 @@ static TRAMPOLINE_HOOK(cont_reset_hook) {
 	return invoke_saved_block_no_args(aTHX);
 }
 
+static TRAMPOLINE_HOOK(destroy_cont_hook) {
+	cont_t *cont;
+
+	assert(MY_CXT.saved_cont != NULL);
+	cont = MY_CXT.saved_cont;
+	MY_CXT.saved_cont = NULL;
+
+	destroy_cont(cont);
+
+	return NORMAL;
+}
+
 
 MODULE = Continuation::Delimited		PACKAGE = Continuation::Delimited
 
@@ -1386,5 +1414,10 @@ MODULE = Continuation::Delimited		PACKAGE = Continuation::Delimited::State
 void
 DESTROY (cont_t *cont)
 	CODE:
-		destroy_cont(aTHX_ cont);
+		printf("destroy\n");
+
+		assert(MY_CXT.saved_cont == NULL);
+		MY_CXT.saved_cont = cont;
+
+		TRAMPOLINE(destroy_cont_hook);
 
