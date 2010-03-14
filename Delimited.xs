@@ -150,7 +150,7 @@ static void print_cont (cont_t *cont) {
 
 /* stashes a block for future invocation. Since the trampoline can't pass
  * values using the stack, we have to save it temporarily. This is used by
- * cont_reset { } and cont_shift { }'s calling convention */
+ * delimit { } and suspend { }'s calling convention */
 static void trampoline_save_block (pTHX_ CV *block) {
 	dMY_CXT;
 
@@ -1205,7 +1205,7 @@ static void destroy_cont (pTHX_ cont_t *cont) {
 /* this is the hook used to invoke continuations, it's fired using the
  * trampoline code above to avoid needing to mop up the extra XSUB context */
 
-static TRAMPOLINE_HOOK(invoke_hook) {
+static TRAMPOLINE_HOOK(resume_hook) {
 	dSP;
 	I32 i;
 	dMY_CXT;
@@ -1241,11 +1241,11 @@ static TRAMPOLINE_HOOK(invoke_hook) {
  * CVs based on it, it's not a static function anywhere
  *
  * note that it is only glorified argument handling and trampoline setup, the
- * actual invocation is done outisde of the XSUB context inside invoke_hook
+ * actual invocation is done outisde of the XSUB context inside resume_hook
  * (called like an opcode) */
 
-XS(XS_Continuation__Delimited_cont_invoke); /* prototype to pass -Wmissing-prototypes */
-XS(XS_Continuation__Delimited_cont_invoke)
+XS(XS_Continuation__Delimited_cont_resume); /* prototype to pass -Wmissing-prototypes */
+XS(XS_Continuation__Delimited_cont_resume)
 {
 #ifdef dVAR
     dVAR; dXSARGS;
@@ -1272,7 +1272,7 @@ XS(XS_Continuation__Delimited_cont_invoke)
 	TRAMPOLINE_SAVE_ARGS;
 	TRAMPOLINE_SAVE_OP;
 
-	TRAMPOLINE(invoke_hook);
+	TRAMPOLINE(resume_hook);
 }
 
 
@@ -1284,8 +1284,8 @@ static SV *cont_to_obj (pTHX_ cont_t *cont) {
 /* reify a cont_t into a CV */
 
 static CV *cont_to_cv (pTHX_ cont_t *cont) {
-	/* create an anonymous CV from the cont_invoke hook */
-	CV *cv = newXS(NULL, XS_Continuation__Delimited_cont_invoke, "Delimited.xs");
+	/* create an anonymous CV from the cont_resume hook */
+	CV *cv = newXS(NULL, XS_Continuation__Delimited_cont_resume, "Delimited.xs");
 	sv_2mortal((SV *)cv);
 
 	/* put the cont_t in the CV's extra pointer */
@@ -1321,8 +1321,8 @@ static TRAMPOLINE_HOOK(stackdump) {
  *
  * invoked from the trampoline hook so that the XSUB scope structures do not
  * have to be unwound (effectively called as an opcode in the scope that called
- * cont_shift */
-static TRAMPOLINE_HOOK(cont_shift_hook) {
+ * suspend */
+static TRAMPOLINE_HOOK(suspend_hook) {
 	cont_t *cont;
 	CV *cont_cv;
 	SV *coderef;
@@ -1341,7 +1341,7 @@ static TRAMPOLINE_HOOK(cont_shift_hook) {
 	invoke_saved_block(aTHX_ coderef);
 }
 
-static TRAMPOLINE_HOOK(cont_reset_hook) {
+static TRAMPOLINE_HOOK(delimit_hook) {
 	/* restore PL_op so that the delimiter contains the right value, the
 	 * current value is set by the trampoline hack */
 	TRAMPOLINE_RESTORE_OP;
@@ -1378,7 +1378,7 @@ BOOT:
 
 
 void
-cont_shift (CV *block)
+suspend (CV *block)
 	PROTOTYPE: &
 	PREINIT:
 		dMY_CXT;
@@ -1392,17 +1392,17 @@ cont_shift (CV *block)
 
 		trampoline_save_block(aTHX_ block);
 		TRAMPOLINE_SAVE_OP;
-		TRAMPOLINE(cont_shift_hook);
+		TRAMPOLINE(suspend_hook);
 
 void
-cont_reset (CV *block)
+delimit (CV *block)
 	PROTOTYPE: &
 	PREINIT:
 		dMY_CXT;
 	PPCODE:
 		trampoline_save_block(aTHX_ block);
 		TRAMPOLINE_SAVE_OP;
-		TRAMPOLINE(cont_reset_hook);
+		TRAMPOLINE(delimit_hook);
 
 void stk ()
 	PPCODE:

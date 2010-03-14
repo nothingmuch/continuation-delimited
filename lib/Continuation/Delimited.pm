@@ -10,8 +10,8 @@ use XS::Object::Magic;
 
 use Sub::Exporter -setup => {
 	exports => [qw(
-		cont_reset
-		cont_shift
+		delimit
+		suspend
 	)],
 };
 

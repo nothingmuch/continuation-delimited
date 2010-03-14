@@ -6,7 +6,7 @@ use warnings;
 use Test::More tests => 11;
 use Scalar::Util qw(refaddr);
 
-use ok 'Continuation::Delimited' => qw(cont_reset cont_shift);
+use ok 'Continuation::Delimited' => qw(delimit suspend);
 
 # based on http://coach.cs.uchicago.edu/package-source/murphy/amb.plt/1/0/planet-docs/amb/index.html
 
@@ -19,7 +19,7 @@ sub amb_call {
 	# this could be optimized when the operation *is* deterministic:
 	# return $items[0] if @items == 1;
 
-	cont_shift {
+	suspend {
 		my $k = shift;
 		# $k is the continuation for the remainder of the amb_find, delimited
 		# by amb_find or the last amb_call.
@@ -27,7 +27,7 @@ sub amb_call {
 		# we try to execute $k with every param in @items, causing amb_call to
 		# return these values
 		foreach my $item ( @items ) {
-			my $result = cont_reset {
+			my $result = delimit {
 				# this expression is delimited for backtracking to return
 				# $fail in $result
 				$k->($item);
@@ -48,7 +48,7 @@ sub amb_call {
 sub amb_find (&) {
 	my $block = shift;
 
-	my $result = cont_reset { $block->() };
+	my $result = delimit { $block->() };
 
 	if ( amb_is_failure($result) ) {
 		die "No solution";

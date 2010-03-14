@@ -5,7 +5,7 @@ use warnings;
 
 use Test::More tests => 31;
 
-use ok 'Continuation::Delimited' => qw(cont_reset cont_shift);
+use ok 'Continuation::Delimited' => qw(delimit suspend);
 
 sub generator (&) {
 	my $body = shift;
@@ -17,8 +17,8 @@ sub generator (&) {
 			my $ret = shift;
 
 #$^D="DXstvRl";
-			cont_shift {
-				# capture the state in $k, and return $ret from cont_reset { }
+			suspend {
+				# capture the state in $k, and return $ret from delimit { }
 				# on the next invocation of the generator $k will be invoked to
 				# return from yield(), resuming the genrator body
 				$k = shift;
@@ -32,11 +32,11 @@ $^D="";
 			return $k->(); # FIXME test &$k, causes segfaulting
 		} else {
 			# the generator is being invoked with no captured state
-			return cont_reset {
+			return delimit {
 				my $ret = &$body; # FIXME test that @_ is passed through properly
 				# the generator has returned normall (using return instead of
 				# yield), so it's finished. clear the captured state (if any) and return
-				# the value from cont_reset normally
+				# the value from delimit normally
 				undef $k;
 				return $ret;
 			};
@@ -50,10 +50,10 @@ my $manual = do {
 		if ( $k ) {
 			return $k->(); # FIXME test &$k
 		} else {
-			return cont_reset {
-				cont_shift { $k = shift; return 1 };
-				cont_shift { $k = shift; return 2 };
-				cont_shift { $k = shift; return 3 };
+			return delimit {
+				suspend { $k = shift; return 1 };
+				suspend { $k = shift; return 2 };
+				suspend { $k = shift; return 3 };
 
 				undef $k;
 

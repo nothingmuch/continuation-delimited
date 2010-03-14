@@ -5,17 +5,17 @@ use warnings;
 
 use Test::More tests => 58;
 
-use ok 'Continuation::Delimited' => qw(cont_reset cont_shift);
+use ok 'Continuation::Delimited' => qw(delimit suspend);
 
 my $after = 0;
 my $invoked = 0;
 my $created = 0;
 my $count = 7;
 
-my $add = cont_reset {
+my $add = delimit {
 	pass("inside delimited scope");
 
-	my $value = cont_shift {
+	my $value = suspend {
 		my $k = shift;
 
 		pass("created cont");
@@ -65,11 +65,11 @@ is( $after, 1, "reset retop not reinvoked" );
 is( $count, 10, "count var updated" );
 
 sub foo {
-	my $value = cont_shift { return $_[0] };
+	my $value = suspend { return $_[0] };
 	return 3 + $value;
 }
 
-my $add_foo = cont_reset { foo() };
+my $add_foo = delimit { foo() };
 
 is( ref $add_foo, "CODE", "captured cont" );
 
@@ -77,10 +77,10 @@ is( $add_foo->(7), 10, "Add with a sub" );
 is( $add_foo->(5), 8, "Add with a sub" );
 
 sub quxx {
-	return 1 + cont_shift { return $_[0] };
+	return 1 + suspend { return $_[0] };
 }
 
-my $add_quxx = cont_reset { quxx() };
+my $add_quxx = delimit { quxx() };
 
 is( ref $add_quxx, "CODE", "captured cont" );
 
@@ -89,27 +89,27 @@ my $y = $add_quxx->(1);
 is( $y, 2, "Add with a sub (no temp var)" );
 is( $add_quxx->(3), 4, "Add with a sub (no temp var)" );
 
-sub bar { $_[0] + cont_shift { return $_[0] } }
+sub bar { $_[0] + suspend { return $_[0] } }
 
-my $add_bar = cont_reset { bar(4) };
+my $add_bar = delimit { bar(4) };
 
 is( ref $add_bar, "CODE", "captured cont" );
 
 is( $add_bar->(7), 11, "Add with a sub using \@_" );
 is( $add_bar->(5), 9, "Add with a sub using \@_" );
 
-sub baz { my $add = shift; $add + cont_shift { return $_[0] } }
+sub baz { my $add = shift; $add + suspend { return $_[0] } }
 
-my $add_baz = cont_reset { baz(7) };
+my $add_baz = delimit { baz(7) };
 
 is( ref $add_baz, "CODE", "captured cont" );
 
 is( $add_baz->(7), 14, "Add with a sub using lexical" );
 is( $add_baz->(10), 17, "Add with a sub using lexical" );
 
-sub my_shift { cont_shift { return $_[0] } }
+sub my_shift { suspend { return $_[0] } }
 sub zot { my $x = $_[0]; $x += my_shift(); return $x } # tests that $x is cloned on the stack
-sub make_zot { cont_reset { zot(13) } };
+sub make_zot { delimit { zot(13) } };
 
 my $add_zot = make_zot();
 
@@ -129,8 +129,8 @@ is( $add_zot->(1), 14, "Add with a nested sub" );
 	my ( @log, $end );
 
 	sub steps {
-		cont_reset {
-			push @log, my_shift(); # sub { cont_shift { return $_[0] } }->(); # the second form works, the first fails (pad screwups?)
+		delimit {
+			push @log, my_shift(); # sub { suspend { return $_[0] } }->(); # the second form works, the first fails (pad screwups?)
 			push @log, my_shift();
 			push @log, my_shift();
 			$end++;
